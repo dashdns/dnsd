@@ -17,7 +17,7 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf bpf_program.c -- -I/usr/include/bpf -Wall
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf bpf/xdp_tc.c -- -I/usr/include/bpf -Wall
 
 type DNSProxy struct {
 	iface          string
@@ -26,7 +26,14 @@ type DNSProxy struct {
 	tcLink         link.Link
 	objs           *bpfObjects
 	blockedDomains map[string]bool
+	ipAllowlist    map[string][]string // clientIP -> allowed domains
 	dnsClient      *dns.Client
+}
+
+// IPDomainKey matches the BPF ip_domain_key struct
+type IPDomainKey struct {
+	ClientIP   uint32
+	DomainHash uint32
 }
 
 func main() {
@@ -45,8 +52,14 @@ func main() {
 		iface:          *iface,
 		upstreamDNS:    *upstream,
 		blockedDomains: make(map[string]bool),
+		ipAllowlist:    make(map[string][]string),
 		dnsClient:      &dns.Client{Net: "udp", Timeout: 5 * time.Second},
 	}
+
+	// Example: Configure per-IP allowlist (will be loaded after BPF init)
+	// TODO: Load from config file
+	proxy.ipAllowlist["192.168.1.10"] = []string{"www.google.com", "google.com"}
+	proxy.ipAllowlist["192.168.1.20"] = []string{"www.youtube.com", "youtube.com"}
 
 	if *blocklist != "" {
 		for _, domain := range strings.Split(*blocklist, ",") {
@@ -66,6 +79,12 @@ func main() {
 	if err := proxy.updateBlocklist(); err != nil {
 		log.Fatalf("Failed to update blocklist: %v", err)
 	}
+
+	// Load per-IP allowlist into BPF map
+	if err := proxy.LoadIPAllowlist(); err != nil {
+		log.Fatalf("Failed to load IP allowlist: %v", err)
+	}
+	log.Printf("Loaded %d IP allowlist rules", len(proxy.ipAllowlist))
 
 	if *blockips != "" {
 		for _, ip := range strings.Split(*blockips, ",") {
@@ -197,6 +216,76 @@ func (p *DNSProxy) updateBlocklist() error {
 		value := uint8(1)
 		if err := p.objs.BlockedDomains.Put(&hash, &value); err != nil {
 			return fmt.Errorf("updating blocklist for %s: %w", domain, err)
+		}
+	}
+	return nil
+}
+
+// AllowDomain adds a domain to the allowlist for a specific client IP
+func (p *DNSProxy) AllowDomain(clientIP, domain string) error {
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address: %s", clientIP)
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("only IPv4 supported: %s", clientIP)
+	}
+
+	// Convert to same format as BPF (network byte order in little-endian uint32)
+	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+	domainHash := hashDomain(domain)
+
+	key := IPDomainKey{
+		ClientIP:   ipKey,
+		DomainHash: domainHash,
+	}
+	value := uint8(1)
+
+	if err := p.objs.IpAllowlist.Put(&key, &value); err != nil {
+		return fmt.Errorf("allowing domain %s for IP %s: %w", domain, clientIP, err)
+	}
+
+	log.Printf("Allowed domain '%s' for IP %s", domain, clientIP)
+	return nil
+}
+
+// RevokeDomain removes a domain from the allowlist for a specific client IP
+func (p *DNSProxy) RevokeDomain(clientIP, domain string) error {
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address: %s", clientIP)
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("only IPv4 supported: %s", clientIP)
+	}
+
+	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+	domainHash := hashDomain(domain)
+
+	key := IPDomainKey{
+		ClientIP:   ipKey,
+		DomainHash: domainHash,
+	}
+
+	if err := p.objs.IpAllowlist.Delete(&key); err != nil {
+		return fmt.Errorf("revoking domain %s for IP %s: %w", domain, clientIP, err)
+	}
+
+	log.Printf("Revoked domain '%s' for IP %s", domain, clientIP)
+	return nil
+}
+
+// LoadIPAllowlist loads per-IP allowlist rules into BPF map
+func (p *DNSProxy) LoadIPAllowlist() error {
+	for clientIP, domains := range p.ipAllowlist {
+		for _, domain := range domains {
+			if err := p.AllowDomain(clientIP, domain); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

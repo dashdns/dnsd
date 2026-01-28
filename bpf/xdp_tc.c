@@ -12,11 +12,26 @@
 #define DNS_PORT 53
 #define MAX_DNS_NAME 255
 
+// Per-IP allowlist key structure
+struct ip_domain_key {
+    __u32 client_ip;      // Source IP (network byte order)
+    __u32 domain_hash;    // Domain hash (DJB2)
+} __attribute__((packed));
+
+// Per-IP domain allowlist (default: block all)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1000000);
+    __type(key, struct ip_domain_key);
+    __type(value, __u8);
+} ip_allowlist SEC(".maps");
+
+// Legacy blocked_domains - kept for backward compatibility
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10000);
     __type(key, __u32);
-    __type(value, __u8);    
+    __type(value, __u8);
 } blocked_domains SEC(".maps");
 
 struct {
@@ -67,11 +82,13 @@ struct dns_header {
     __u16 arcount;
 };
 
-static __always_inline int check_dns_query_blocked_xdp(void *data, void *data_end, __u32 dns_offset) {
+// Check if domain is allowed for the given client IP
+// Returns: 1 = should block (not in allowlist), 0 = allowed
+static __always_inline int check_dns_query_allowed_xdp(void *data, void *data_end, __u32 dns_offset, __u32 client_ip) {
     __u32 pos = dns_offset + sizeof(struct dns_header);
 
     if (data + pos + 32 > data_end) {
-        return 0;
+        return 1;  // Block on parse error (default block all)
     }
 
     unsigned char *qname = data + pos;
@@ -96,16 +113,24 @@ static __always_inline int check_dns_query_blocked_xdp(void *data, void *data_en
     HASH_BYTE(28); HASH_BYTE(29); HASH_BYTE(30); HASH_BYTE(31);
 
 done:
-    bpf_printk("XDP: DNS query hash=0x%x", hash);
+    ;  // Empty statement after label for C compliance
 
-    __u8 *blocked = bpf_map_lookup_elem(&blocked_domains, &hash);
-    if (blocked && *blocked == 1) {
-        bpf_printk("XDP: BLOCKED! Domain hash=0x%x matched blocklist", hash);
-        return 1;
+    // Build composite key for per-IP allowlist lookup
+    struct ip_domain_key key = {
+        .client_ip = client_ip,
+        .domain_hash = hash
+    };
+
+    bpf_printk("XDP: client_ip=0x%x domain_hash=0x%x", client_ip, hash);
+
+    __u8 *allowed = bpf_map_lookup_elem(&ip_allowlist, &key);
+    if (allowed && *allowed == 1) {
+        bpf_printk("XDP: ALLOWED - IP+domain in allowlist");
+        return 0;  // Allowed
     }
 
-    bpf_printk("XDP: ALLOWED - hash=0x%x not in blocklist", hash);
-    return 0;
+    bpf_printk("XDP: BLOCKED - IP+domain NOT in allowlist (default block all)");
+    return 1;  // Block (not in allowlist)
 
     #undef HASH_BYTE
 }
@@ -245,14 +270,16 @@ int xdp_dns_filter(struct xdp_md *ctx) {
     update_stat(STAT_DNS_PACKETS);
 
     __u32 dns_offset = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
+    __u32 client_ip = ip->saddr;  // Source IP of the DNS query
 
-    if (check_dns_query_blocked_xdp(data, data_end, dns_offset)) {
-        bpf_printk("XDP: >>> DROPPING DNS QUERY - BLOCKED DOMAIN <<<");
+    // Per-IP allowlist check (default: block all)
+    if (check_dns_query_allowed_xdp(data, data_end, dns_offset, client_ip)) {
+        bpf_printk("XDP: >>> DROPPING DNS QUERY - NOT IN ALLOWLIST <<<");
         update_stat(STAT_BLOCKED_PACKETS);
         return XDP_DROP;
     }
 
-    bpf_printk("XDP: DNS query PASSED");
+    bpf_printk("XDP: DNS query PASSED (in allowlist)");
     update_stat(STAT_ALLOWED_PACKETS);
     return XDP_PASS;
 }
