@@ -12,21 +12,22 @@
 #define DNS_PORT 53
 #define MAX_DNS_NAME 255
 
-// Per-IP allowlist key structure
+// Per-IP blocklist key structure
 struct ip_domain_key {
     __u32 client_ip;      // Source IP (network byte order)
     __u32 domain_hash;    // Domain hash (DJB2)
 } __attribute__((packed));
 
-// Per-IP domain allowlist (default: block all)
+// Per-IP domain blocklist (default: allow all)
+// Key: (client_ip, domain_hash) -> blocked for this specific IP
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1000000);
     __type(key, struct ip_domain_key);
     __type(value, __u8);
-} ip_allowlist SEC(".maps");
+} ip_blocklist SEC(".maps");
 
-// Legacy blocked_domains - kept for backward compatibility
+// Global domain blocklist (applies to all IPs)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10000);
@@ -41,12 +42,13 @@ struct {
     __type(value, __u8);     
 } blocked_ips SEC(".maps");
 
+// Blocked DNS servers (default: allow all DNS servers)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 100);
     __type(key, __u32);
     __type(value, __u8);
-} allowed_dns_servers SEC(".maps");
+} blocked_dns_servers SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -82,58 +84,98 @@ struct dns_header {
     __u16 arcount;
 };
 
-// Check if domain is allowed for the given client IP
-// Returns: 1 = should block (not in allowlist), 0 = allowed
-static __always_inline int check_dns_query_allowed_xdp(void *data, void *data_end, __u32 dns_offset, __u32 client_ip) {
-    __u32 pos = dns_offset + sizeof(struct dns_header);
+// Hash a single byte and update hash value
+#define HASH_CHAR(qname, i, hash, done_flag) do { \
+    if (!(done_flag) && (void *)&(qname)[i+1] <= data_end) { \
+        unsigned char c = (qname)[i]; \
+        if (c == 0) { \
+            done_flag = 1; \
+        } else { \
+            if (c >= 'A' && c <= 'Z') c += 32; \
+            if (c >= 1 && c <= 63) c = '.'; \
+            hash = ((hash << 5) + hash) + c; \
+        } \
+    } \
+} while(0)
 
-    if (data + pos + 32 > data_end) {
-        return 1;  // Block on parse error (default block all)
+// Check if domain is blocked for the given client IP
+// Returns: 1 = should block (in blocklist), 0 = allowed
+static __always_inline int check_dns_query_blocked_xdp(void *data, void *data_end, __u32 dns_offset, __u32 client_ip) {
+    // Calculate qname position (after DNS header)
+    unsigned char *qname = data + dns_offset + sizeof(struct dns_header);
+
+    // Basic bounds check
+    if ((void *)(qname + 1) > data_end) {
+        bpf_printk("XDP: bounds check failed");
+        return 0;
     }
 
-    unsigned char *qname = data + pos;
-
+    // Hash domain using DJB2 algorithm
+    // DNS wire format: \x03www\x06google\x03com\x00
+    // We convert length bytes (1-63) to '.' to match Go's ".domain" format
     __u32 hash = 5381;
+    int done = 0;
 
-    #define HASH_BYTE(i) do { \
-        unsigned char c = qname[i]; \
-        if (c == 0) goto done; \
-        if (c >= 'A' && c <= 'Z') c += 32; \
-        if (c >= 1 && c <= 63) c = '.'; \
-        hash = ((hash << 5) + hash) + c; \
-    } while(0)
+    // Unroll manually for BPF verifier (max 64 chars)
+    HASH_CHAR(qname, 0, hash, done);  HASH_CHAR(qname, 1, hash, done);
+    HASH_CHAR(qname, 2, hash, done);  HASH_CHAR(qname, 3, hash, done);
+    HASH_CHAR(qname, 4, hash, done);  HASH_CHAR(qname, 5, hash, done);
+    HASH_CHAR(qname, 6, hash, done);  HASH_CHAR(qname, 7, hash, done);
+    HASH_CHAR(qname, 8, hash, done);  HASH_CHAR(qname, 9, hash, done);
+    HASH_CHAR(qname, 10, hash, done); HASH_CHAR(qname, 11, hash, done);
+    HASH_CHAR(qname, 12, hash, done); HASH_CHAR(qname, 13, hash, done);
+    HASH_CHAR(qname, 14, hash, done); HASH_CHAR(qname, 15, hash, done);
+    HASH_CHAR(qname, 16, hash, done); HASH_CHAR(qname, 17, hash, done);
+    HASH_CHAR(qname, 18, hash, done); HASH_CHAR(qname, 19, hash, done);
+    HASH_CHAR(qname, 20, hash, done); HASH_CHAR(qname, 21, hash, done);
+    HASH_CHAR(qname, 22, hash, done); HASH_CHAR(qname, 23, hash, done);
+    HASH_CHAR(qname, 24, hash, done); HASH_CHAR(qname, 25, hash, done);
+    HASH_CHAR(qname, 26, hash, done); HASH_CHAR(qname, 27, hash, done);
+    HASH_CHAR(qname, 28, hash, done); HASH_CHAR(qname, 29, hash, done);
+    HASH_CHAR(qname, 30, hash, done); HASH_CHAR(qname, 31, hash, done);
+    HASH_CHAR(qname, 32, hash, done); HASH_CHAR(qname, 33, hash, done);
+    HASH_CHAR(qname, 34, hash, done); HASH_CHAR(qname, 35, hash, done);
+    HASH_CHAR(qname, 36, hash, done); HASH_CHAR(qname, 37, hash, done);
+    HASH_CHAR(qname, 38, hash, done); HASH_CHAR(qname, 39, hash, done);
+    HASH_CHAR(qname, 40, hash, done); HASH_CHAR(qname, 41, hash, done);
+    HASH_CHAR(qname, 42, hash, done); HASH_CHAR(qname, 43, hash, done);
+    HASH_CHAR(qname, 44, hash, done); HASH_CHAR(qname, 45, hash, done);
+    HASH_CHAR(qname, 46, hash, done); HASH_CHAR(qname, 47, hash, done);
+    HASH_CHAR(qname, 48, hash, done); HASH_CHAR(qname, 49, hash, done);
+    HASH_CHAR(qname, 50, hash, done); HASH_CHAR(qname, 51, hash, done);
+    HASH_CHAR(qname, 52, hash, done); HASH_CHAR(qname, 53, hash, done);
+    HASH_CHAR(qname, 54, hash, done); HASH_CHAR(qname, 55, hash, done);
+    HASH_CHAR(qname, 56, hash, done); HASH_CHAR(qname, 57, hash, done);
+    HASH_CHAR(qname, 58, hash, done); HASH_CHAR(qname, 59, hash, done);
+    HASH_CHAR(qname, 60, hash, done); HASH_CHAR(qname, 61, hash, done);
+    HASH_CHAR(qname, 62, hash, done); HASH_CHAR(qname, 63, hash, done);
 
-    HASH_BYTE(0);  HASH_BYTE(1);  HASH_BYTE(2);  HASH_BYTE(3);
-    HASH_BYTE(4);  HASH_BYTE(5);  HASH_BYTE(6);  HASH_BYTE(7);
-    HASH_BYTE(8);  HASH_BYTE(9);  HASH_BYTE(10); HASH_BYTE(11);
-    HASH_BYTE(12); HASH_BYTE(13); HASH_BYTE(14); HASH_BYTE(15);
-    HASH_BYTE(16); HASH_BYTE(17); HASH_BYTE(18); HASH_BYTE(19);
-    HASH_BYTE(20); HASH_BYTE(21); HASH_BYTE(22); HASH_BYTE(23);
-    HASH_BYTE(24); HASH_BYTE(25); HASH_BYTE(26); HASH_BYTE(27);
-    HASH_BYTE(28); HASH_BYTE(29); HASH_BYTE(30); HASH_BYTE(31);
+    bpf_printk("XDP: client_ip=0x%x", client_ip);
+    bpf_printk("XDP: domain_hash=0x%x", hash);
 
-done:
-    ;  // Empty statement after label for C compliance
-
-    // Build composite key for per-IP allowlist lookup
+    // First check per-IP blocklist
     struct ip_domain_key key = {
         .client_ip = client_ip,
         .domain_hash = hash
     };
 
-    bpf_printk("XDP: client_ip=0x%x domain_hash=0x%x", client_ip, hash);
-
-    __u8 *allowed = bpf_map_lookup_elem(&ip_allowlist, &key);
-    if (allowed && *allowed == 1) {
-        bpf_printk("XDP: ALLOWED - IP+domain in allowlist");
-        return 0;  // Allowed
+    __u8 *blocked = bpf_map_lookup_elem(&ip_blocklist, &key);
+    if (blocked) {
+        bpf_printk("XDP: BLOCKED - per-IP blocklist hit");
+        return 1;
     }
 
-    bpf_printk("XDP: BLOCKED - IP+domain NOT in allowlist (default block all)");
-    return 1;  // Block (not in allowlist)
+    // Then check global domain blocklist
+    blocked = bpf_map_lookup_elem(&blocked_domains, &hash);
+    if (blocked) {
+        bpf_printk("XDP: BLOCKED - global blocklist hit");
+        return 1;
+    }
 
-    #undef HASH_BYTE
+    return 0;
 }
+
+#undef HASH_CHAR
 
 static __always_inline int check_dns_response_blocked_tc(struct __sk_buff *skb, __u32 dns_offset) {
     struct dns_header dns_hdr;
@@ -272,14 +314,15 @@ int xdp_dns_filter(struct xdp_md *ctx) {
     __u32 dns_offset = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
     __u32 client_ip = ip->saddr;  // Source IP of the DNS query
 
-    // Per-IP allowlist check (default: block all)
-    if (check_dns_query_allowed_xdp(data, data_end, dns_offset, client_ip)) {
-        bpf_printk("XDP: >>> DROPPING DNS QUERY - NOT IN ALLOWLIST <<<");
+    // Per-IP and global blocklist check (default: allow all)
+    bpf_printk("XDP: >>> CHecking Blocking status IP client_ip=0x%x  domain_hash=0x%x<<<", client_ip, dns_offset);
+    if (check_dns_query_blocked_xdp(data, data_end, dns_offset, client_ip)) {
+        bpf_printk("XDP: >>> DROPPING DNS QUERY - IN BLOCKLIST <<<");
         update_stat(STAT_BLOCKED_PACKETS);
         return XDP_DROP;
     }
 
-    bpf_printk("XDP: DNS query PASSED (in allowlist)");
+    bpf_printk("XDP: DNS query PASSED (not in blocklist)");
     update_stat(STAT_ALLOWED_PACKETS);
     return XDP_PASS;
 }
@@ -330,16 +373,17 @@ int tc_dns_filter(struct __sk_buff *skb) {
 
     update_stat(STAT_DNS_PACKETS);
 
-    __u8 *allowed = bpf_map_lookup_elem(&allowed_dns_servers, &dest_ip);
+    // Check if DNS server is blocked (default: allow all)
+    __u8 *blocked = bpf_map_lookup_elem(&blocked_dns_servers, &dest_ip);
 
-    if (allowed && *allowed == 1) {
-        bpf_printk("TC: DNS query ALLOWED (whitelisted DNS server)");
-        update_stat(STAT_ALLOWED_PACKETS);
-        return TC_ACT_OK;
+    if (blocked && *blocked == 1) {
+        bpf_printk("TC: DNS query BLOCKED (blocked DNS server)");
+        update_stat(STAT_BLOCKED_PACKETS);
+        return TC_ACT_SHOT;
     }
-    bpf_printk("TC: DNS query BLOCKED (unauthorized DNS server)");
-    update_stat(STAT_BLOCKED_PACKETS);
-    return TC_ACT_SHOT;
+    bpf_printk("TC: DNS query ALLOWED (DNS server not in blocklist)");
+    update_stat(STAT_ALLOWED_PACKETS);
+    return TC_ACT_OK;
 }
 
 char _license[] SEC("license") = "GPL";
