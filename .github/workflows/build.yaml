@@ -6,7 +6,7 @@ on:
       - "*"
 
 jobs:
-  build-and-push-runbookstore-api-image:
+  build-and-push-dnsd:
     runs-on: ubuntu-latest
 
     steps:
