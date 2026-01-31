@@ -3,7 +3,7 @@ services:
     container_name: dashdns
     image: dasdns:v1
     privileged: true
-    command: "/dashdns/dnsd -ip-blocklist='192.168.65.1:www.facebook.com'  -iface eth0"
+    command: "/dashdns/dnsd -ip-blocklist='192.168.65.1:www.facebook.com'  -iface eth0 -ip-blocklist-url=http://172.19.0.2:8000/index.json"
     volumes:
       - /sys/fs/bpf:/sys/fs/bpf:rw
       - /sys/kernel/debug:/sys/kernel/debug:ro

@@ -1,0 +1,12 @@
+{
+   "blocklist": [
+        {
+            "ip": "172.217.16.209",
+                "domains": [
+                    "www.facebook.com",
+                    "ifconfig.co",
+                    "beta.sketchpad.app"
+                ]
+        }
+    ]
+}
