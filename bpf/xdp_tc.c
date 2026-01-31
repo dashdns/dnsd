@@ -1,3 +1,4 @@
+
 //go:build ignore
 
 #include <linux/bpf.h>
@@ -38,8 +39,8 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10000);
-    __type(key, __u32);  
-    __type(value, __u8);     
+    __type(key, __u32);
+    __type(value, __u8);
 } blocked_ips SEC(".maps");
 
 // Blocked DNS servers (default: allow all DNS servers)
