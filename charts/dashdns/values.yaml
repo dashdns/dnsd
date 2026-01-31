@@ -1,0 +1,107 @@
+# Default values for dashdns
+# This is a YAML-formatted file.
+
+# Number of old history revisions to retain
+revisionHistoryLimit: 3
+
+image:
+  repository: emirozbir/dnsd
+  tag: "v1"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# DNS configuration
+dns:
+  # Network interface to attach XDP/TC programs
+  interface: "eth0"
+  # Upstream DNS server
+  upstream: "1.1.1.1:53"
+  # Global blocklist - comma-separated list of domains to block
+  blocklist: ""
+  # IPs to block in DNS responses - comma-separated
+  blockIps: ""
+  # Blocked DNS servers - comma-separated list of IPs
+  blockedDns: ""
+  # Per-IP blocklist in format: IP1:domain1,domain2;IP2:domain3
+  ipBlocklist: ""
+  # URL to fetch per-IP blocklist from (JSON format)
+  ipBlocklistUrl: ""
+  # Interval to refresh the remote IP blocklist
+  ipBlocklistInterval: "5m"
+
+# Additional command arguments
+extraArgs: []
+
+# Pod-level security context
+podSecurityContext: {}
+
+# Container security context - requires privileged for eBPF
+securityContext:
+  privileged: true
+  capabilities:
+    add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - SYS_RESOURCE
+
+# Service configuration
+service:
+  enabled: true
+  type: NodePort
+  port: 53
+  nodePort: 30053
+  protocol: UDP
+
+# Resource limits and requests
+resources: {}
+  # limits:
+  #   cpu: 500m
+  #   memory: 256Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations for scheduling on tainted nodes
+tolerations: []
+  # - key: "node-role.kubernetes.io/control-plane"
+  #   operator: "Exists"
+  #   effect: "NoSchedule"
+
+# Affinity rules
+affinity: {}
+
+# Update strategy for DaemonSet
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+# ServiceAccount configuration
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}
+
+# Priority class name
+priorityClassName: ""
+
+# Host network mode (may be needed for some network configurations)
+hostNetwork: false
+
+# DNS policy (ClusterFirst, Default, ClusterFirstWithHostNet, None)
+dnsPolicy: ClusterFirst
+
+# Termination grace period
+terminationGracePeriodSeconds: 30

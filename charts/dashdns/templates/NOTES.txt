@@ -1,0 +1,31 @@
+DashDNS has been deployed as a DaemonSet.
+
+1. Get the DNS service endpoint:
+{{- if eq .Values.service.type "NodePort" }}
+   export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+   export NODE_PORT={{ .Values.service.nodePort | default "30053" }}
+   echo "DNS Server: $NODE_IP:$NODE_PORT"
+{{- else if eq .Values.service.type "ClusterIP" }}
+   export CLUSTER_IP=$(kubectl get svc {{ include "dashdns.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.spec.clusterIP}')
+   echo "DNS Server: $CLUSTER_IP:{{ .Values.service.port }}"
+{{- end }}
+
+2. Test DNS resolution:
+   dig @$NODE_IP -p $NODE_PORT example.com
+
+3. Check DaemonSet status:
+   kubectl get daemonset {{ include "dashdns.fullname" . }} -n {{ .Release.Namespace }}
+
+4. View logs:
+   kubectl logs -l app.kubernetes.io/name={{ include "dashdns.name" . }} -n {{ .Release.Namespace }} -f
+
+Configuration:
+- Interface: {{ .Values.dns.interface }}
+- Upstream DNS: {{ .Values.dns.upstream }}
+{{- if .Values.dns.blocklist }}
+- Global Blocklist: {{ .Values.dns.blocklist }}
+{{- end }}
+{{- if .Values.dns.ipBlocklistUrl }}
+- Policy URL: {{ .Values.dns.ipBlocklistUrl }}
+- Refresh Interval: {{ .Values.dns.ipBlocklistInterval }}
+{{- end }}

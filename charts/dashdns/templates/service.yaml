@@ -1,0 +1,20 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dashdns.fullname" . }}
+  labels:
+    {{- include "dashdns.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "dashdns.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: dns-udp
+      port: {{ .Values.service.port }}
+      targetPort: dns-udp
+      protocol: {{ .Values.service.protocol }}
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+{{- end }}

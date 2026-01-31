@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "dashdns.fullname" . }}
+  labels:
+    {{- include "dashdns.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "dashdns.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "dashdns.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "dashdns.serviceAccountName" . }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/dashdns/dnsd"]
+          args:
+            - "-iface={{ .Values.dns.interface }}"
+            - "-upstream={{ .Values.dns.upstream }}"
+            {{- if .Values.dns.blocklist }}
+            - "-blocklist={{ .Values.dns.blocklist }}"
+            {{- end }}
+            {{- if .Values.dns.blockIps }}
+            - "-blockips={{ .Values.dns.blockIps }}"
+            {{- end }}
+            {{- if .Values.dns.blockedDns }}
+            - "-blocked-dns={{ .Values.dns.blockedDns }}"
+            {{- end }}
+            {{- if .Values.dns.ipBlocklist }}
+            - "-ip-blocklist={{ .Values.dns.ipBlocklist }}"
+            {{- end }}
+            {{- if .Values.dns.ipBlocklistUrl }}
+            - "-ip-blocklist-url={{ .Values.dns.ipBlocklistUrl }}"
+            {{- end }}
+            {{- if .Values.dns.ipBlocklistInterval }}
+            - "-ip-blocklist-interval={{ .Values.dns.ipBlocklistInterval }}"
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: bpf
+              mountPath: /sys/fs/bpf
+            - name: debug
+              mountPath: /sys/kernel/debug
+              readOnly: true
+      volumes:
+        - name: bpf
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: debug
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
