@@ -1,13 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,16 +21,30 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// IPBlocklistEntry represents a single entry in the remote blocklist
+type IPBlocklistEntry struct {
+	IP      string   `json:"ip"`
+	Domains []string `json:"domains"`
+}
+
+// IPBlocklistResponse represents the JSON response from the remote blocklist endpoint
+type IPBlocklistResponse struct {
+	Blocklist []IPBlocklistEntry `json:"blocklist"`
+}
+
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf bpf/xdp_tc.c -- -I/usr/include/bpf -Wall
 
 type DNSProxy struct {
-	iface          string
-	upstreamDNS    string
-	xdpLink        link.Link
-	tcLink         link.Link
-	objs           *bpfObjects
-	blockedDomains map[string]bool
-	dnsClient      *dns.Client
+	iface            string
+	upstreamDNS      string
+	xdpLink          link.Link
+	tcLink           link.Link
+	objs             *bpfObjects
+	blockedDomains   map[string]bool
+	dnsClient        *dns.Client
+	ipBlocklistURL   string
+	ipBlocklistMu    sync.RWMutex
+	currentBlocklist []IPBlocklistEntry // track current entries for diffing
 }
 
 // IPDomainKey matches the BPF ip_domain_key struct
@@ -42,6 +60,8 @@ func main() {
 	blockips := flag.String("blockips", "", "Comma-separated list of IPs to block in DNS responses")
 	blockedDNS := flag.String("blocked-dns", "", "Comma-separated list of blocked DNS server IPs")
 	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
+	ipBlocklistURL := flag.String("ip-blocklist-url", "", "URL to fetch per-IP blocklist from (JSON format)")
+	ipBlocklistInterval := flag.Duration("ip-blocklist-interval", 5*time.Minute, "Interval to refresh the remote IP blocklist")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -49,10 +69,12 @@ func main() {
 	}
 
 	proxy := &DNSProxy{
-		iface:          *iface,
-		upstreamDNS:    *upstream,
-		blockedDomains: make(map[string]bool),
-		dnsClient:      &dns.Client{Net: "udp", Timeout: 5 * time.Second},
+		iface:            *iface,
+		upstreamDNS:      *upstream,
+		blockedDomains:   make(map[string]bool),
+		dnsClient:        &dns.Client{Net: "udp", Timeout: 5 * time.Second},
+		ipBlocklistURL:   *ipBlocklistURL,
+		currentBlocklist: []IPBlocklistEntry{},
 	}
 
 	if *blocklist != "" {
@@ -133,6 +155,16 @@ func main() {
 
 	if blockedDNSCount > 0 {
 		log.Printf("DNS server blocklist active: %d DNS server(s) blocked", blockedDNSCount)
+	}
+
+	// Start remote IP blocklist fetcher if URL is provided
+	if *ipBlocklistURL != "" {
+		// Fetch immediately on startup
+		if err := proxy.fetchAndUpdateIPBlocklist(); err != nil {
+			log.Printf("Warning: initial remote IP blocklist fetch failed: %v", err)
+		}
+		// Start periodic refresh
+		go proxy.startIPBlocklistRefresher(*ipBlocklistInterval)
 	}
 
 	log.Printf("DNS Proxy started on interface %s", *iface)
@@ -510,4 +542,103 @@ func (p *DNSProxy) cleanup() {
 	}
 
 	log.Println("Cleanup completed")
+}
+
+// fetchAndUpdateIPBlocklist fetches the IP blocklist from the remote URL and updates the BPF maps
+func (p *DNSProxy) fetchAndUpdateIPBlocklist() error {
+	if p.ipBlocklistURL == "" {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(p.ipBlocklistURL)
+	if err != nil {
+		return fmt.Errorf("fetching IP blocklist: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading response body: %w", err)
+	}
+
+	var blocklist IPBlocklistResponse
+	if err := json.Unmarshal(body, &blocklist); err != nil {
+		return fmt.Errorf("parsing JSON: %w", err)
+	}
+
+	p.ipBlocklistMu.Lock()
+	defer p.ipBlocklistMu.Unlock()
+
+	// Build sets of current and new entries for diffing
+	currentSet := make(map[string]map[string]bool)
+	for _, entry := range p.currentBlocklist {
+		if currentSet[entry.IP] == nil {
+			currentSet[entry.IP] = make(map[string]bool)
+		}
+		for _, domain := range entry.Domains {
+			currentSet[entry.IP][strings.ToLower(domain)] = true
+		}
+	}
+
+	newSet := make(map[string]map[string]bool)
+	for _, entry := range blocklist.Blocklist {
+		if newSet[entry.IP] == nil {
+			newSet[entry.IP] = make(map[string]bool)
+		}
+		for _, domain := range entry.Domains {
+			newSet[entry.IP][strings.ToLower(domain)] = true
+		}
+	}
+
+	// Remove entries that are no longer in the new blocklist
+	for ip, domains := range currentSet {
+		for domain := range domains {
+			if newSet[ip] == nil || !newSet[ip][domain] {
+				if err := p.UnblockDomainForIP(ip, domain); err != nil {
+					log.Printf("Warning: failed to unblock domain %s for IP %s: %v", domain, ip, err)
+				}
+			}
+		}
+	}
+
+	// Add new entries
+	addedCount := 0
+	for _, entry := range blocklist.Blocklist {
+		for _, domain := range entry.Domains {
+			domain = strings.ToLower(domain)
+			// Only add if not already present
+			if currentSet[entry.IP] == nil || !currentSet[entry.IP][domain] {
+				if err := p.BlockDomainForIP(entry.IP, domain); err != nil {
+					log.Printf("Warning: failed to block domain %s for IP %s: %v", domain, entry.IP, err)
+				} else {
+					addedCount++
+				}
+			}
+		}
+	}
+
+	// Update current blocklist
+	p.currentBlocklist = blocklist.Blocklist
+
+	log.Printf("Remote IP blocklist updated: %d entries total, %d new entries added", len(blocklist.Blocklist), addedCount)
+	return nil
+}
+
+// startIPBlocklistRefresher periodically fetches and updates the IP blocklist
+func (p *DNSProxy) startIPBlocklistRefresher(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Printf("IP blocklist refresher started (interval: %v)", interval)
+
+	for range ticker.C {
+		if err := p.fetchAndUpdateIPBlocklist(); err != nil {
+			log.Printf("Error refreshing IP blocklist: %v", err)
+		}
+	}
 }
