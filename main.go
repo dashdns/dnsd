@@ -17,7 +17,7 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf bpf_program.c -- -I/usr/include/bpf -Wall
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf bpf/xdp_tc.c -- -I/usr/include/bpf -Wall
 
 type DNSProxy struct {
 	iface          string
@@ -29,12 +29,19 @@ type DNSProxy struct {
 	dnsClient      *dns.Client
 }
 
+// IPDomainKey matches the BPF ip_domain_key struct
+type IPDomainKey struct {
+	ClientIP   uint32
+	DomainHash uint32
+}
+
 func main() {
 	iface := flag.String("iface", "lo", "Network interface to attach XDP/TC programs")
 	upstream := flag.String("upstream", "8.8.8.8:53", "Upstream DNS server")
-	blocklist := flag.String("blocklist", "www.google.com", "Comma-separated list of domains to block")
+	blocklist := flag.String("blocklist", "", "Comma-separated list of domains to block globally")
 	blockips := flag.String("blockips", "", "Comma-separated list of IPs to block in DNS responses")
-	allowedDNS := flag.String("allowed-dns", "", "Comma-separated list of allowed DNS server IPs (whitelist). All other DNS servers will be blocked!")
+	blockedDNS := flag.String("blocked-dns", "", "Comma-separated list of blocked DNS server IPs")
+	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -78,24 +85,54 @@ func main() {
 		}
 	}
 
-	allowedCount := 0
-	if *allowedDNS != "" {
-		for _, ip := range strings.Split(*allowedDNS, ",") {
+	blockedDNSCount := 0
+	if *blockedDNS != "" {
+		for _, ip := range strings.Split(*blockedDNS, ",") {
 			ip = strings.TrimSpace(ip)
 			if ip != "" {
-				if err := proxy.AllowDNSServer(ip); err != nil {
+				if err := proxy.BlockDNSServer(ip); err != nil {
 					log.Printf("Warning: %v", err)
 				} else {
-					allowedCount++
+					blockedDNSCount++
 				}
 			}
 		}
 	}
 
-	if allowedCount > 0 {
-		log.Printf("DNS whitelist active: only %d DNS server(s) allowed, all others will be BLOCKED", allowedCount)
-	} else {
-		log.Printf("WARNING: No allowed DNS servers specified! ALL DNS queries will be BLOCKED!")
+	// Parse and load per-IP blocklist
+	// Format: "IP1:domain1,domain2;IP2:domain3,domain4"
+	ipBlocklistCount := 0
+	if *ipBlocklist != "" {
+		for _, entry := range strings.Split(*ipBlocklist, ";") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			parts := strings.SplitN(entry, ":", 2)
+			if len(parts) != 2 {
+				log.Printf("Warning: invalid ip-blocklist entry format: %s (expected IP:domain1,domain2)", entry)
+				continue
+			}
+			clientIP := strings.TrimSpace(parts[0])
+			domains := strings.Split(parts[1], ",")
+			for _, domain := range domains {
+				domain = strings.TrimSpace(domain)
+				if domain != "" {
+					if err := proxy.BlockDomainForIP(clientIP, domain); err != nil {
+						log.Printf("Warning: %v", err)
+					} else {
+						ipBlocklistCount++
+					}
+				}
+			}
+		}
+	}
+	if ipBlocklistCount > 0 {
+		log.Printf("Loaded %d per-IP blocklist rules", ipBlocklistCount)
+	}
+
+	if blockedDNSCount > 0 {
+		log.Printf("DNS server blocklist active: %d DNS server(s) blocked", blockedDNSCount)
 	}
 
 	log.Printf("DNS Proxy started on interface %s", *iface)
@@ -202,6 +239,65 @@ func (p *DNSProxy) updateBlocklist() error {
 	return nil
 }
 
+// BlockDomainForIP adds a domain to the blocklist for a specific client IP
+func (p *DNSProxy) BlockDomainForIP(clientIP, domain string) error {
+	ip := net.ParseIP(clientIP)
+	fmt.Println("The client IP address is ", ip)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address: %s", clientIP)
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("only IPv4 supported: %s", clientIP)
+	}
+
+	// Convert to same format as BPF (network byte order in little-endian uint32)
+	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+	domainHash := hashDomain(domain)
+
+	key := IPDomainKey{
+		ClientIP:   ipKey,
+		DomainHash: domainHash,
+	}
+	value := uint8(1)
+
+	if err := p.objs.IpBlocklist.Put(&key, &value); err != nil {
+		return fmt.Errorf("blocking domain %s for IP %s: %w", domain, clientIP, err)
+	}
+
+	log.Printf("Blocked domain '%s' for IP %s (ipKey=0x%x, hash=0x%x)", domain, clientIP, ipKey, domainHash)
+	return nil
+}
+
+// UnblockDomainForIP removes a domain from the blocklist for a specific client IP
+func (p *DNSProxy) UnblockDomainForIP(clientIP, domain string) error {
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address: %s", clientIP)
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("only IPv4 supported: %s", clientIP)
+	}
+
+	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+	domainHash := hashDomain(domain)
+
+	key := IPDomainKey{
+		ClientIP:   ipKey,
+		DomainHash: domainHash,
+	}
+
+	if err := p.objs.IpBlocklist.Delete(&key); err != nil {
+		return fmt.Errorf("unblocking domain %s for IP %s: %w", domain, clientIP, err)
+	}
+
+	log.Printf("Unblocked domain '%s' for IP %s", domain, clientIP)
+	return nil
+}
+
 func (p *DNSProxy) BlockIP(ipStr string) error {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -224,7 +320,7 @@ func (p *DNSProxy) BlockIP(ipStr string) error {
 	return nil
 }
 
-func (p *DNSProxy) AllowDNSServer(ipStr string) error {
+func (p *DNSProxy) BlockDNSServer(ipStr string) error {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return fmt.Errorf("invalid IP address: %s", ipStr)
@@ -240,11 +336,11 @@ func (p *DNSProxy) AllowDNSServer(ipStr string) error {
 	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
 	value := uint8(1)
 
-	if err := p.objs.AllowedDnsServers.Put(&ipKey, &value); err != nil {
-		return fmt.Errorf("allowing DNS server %s: %w", ipStr, err)
+	if err := p.objs.BlockedDnsServers.Put(&ipKey, &value); err != nil {
+		return fmt.Errorf("blocking DNS server %s: %w", ipStr, err)
 	}
 
-	log.Printf("Allowed DNS server: %s", ipStr)
+	log.Printf("Blocked DNS server: %s", ipStr)
 	return nil
 }
 
@@ -282,7 +378,7 @@ func (p *DNSProxy) reportStats() {
 
 func (p *DNSProxy) startDNSServer() {
 	server := &dns.Server{
-		Addr: "127.0.0.1:5353",
+		Addr: "0.0.0.0:53",
 		Net:  "udp",
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 			p.handleDNSRequest(w, r)
@@ -296,16 +392,34 @@ func (p *DNSProxy) startDNSServer() {
 }
 
 func (p *DNSProxy) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	// Get client IP from the request
+	clientAddr := w.RemoteAddr().String()
+	clientIP, _, err := net.SplitHostPort(clientAddr)
+	if err != nil {
+		clientIP = clientAddr // fallback if no port
+	}
+	fmt.Println("Client IP: ", clientIP)
+
 	if len(r.Question) > 0 {
 		domain := strings.ToLower(r.Question[0].Name)
 		domain = strings.TrimSuffix(domain, ".")
+		fmt.Println("The domain address is ", domain)
 
-		if p.isBlocked(domain) {
-			// Return NXDOMAIN for blocked domains
+		// Check per-IP blocklist first
+		if p.isBlockedForIP(clientIP, domain) {
 			m := new(dns.Msg)
 			m.SetRcode(r, dns.RcodeNameError)
 			w.WriteMsg(m)
-			log.Printf("Blocked (userspace): %s", domain)
+			log.Printf("Blocked (userspace per-IP): %s for client %s", domain, clientIP)
+			return
+		}
+
+		// Check global blocklist
+		if p.isBlocked(domain) {
+			m := new(dns.Msg)
+			m.SetRcode(r, dns.RcodeNameError)
+			w.WriteMsg(m)
+			log.Printf("Blocked (userspace global): %s", domain)
 			return
 		}
 	}
@@ -337,6 +451,37 @@ func (p *DNSProxy) isBlocked(domain string) bool {
 		if p.blockedDomains[subdomain] {
 			return true
 		}
+	}
+
+	return false
+}
+
+// isBlockedForIP checks if a domain is blocked for a specific client IP using BPF map
+func (p *DNSProxy) isBlockedForIP(clientIP, domain string) bool {
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false // IPv6 not supported
+	}
+
+	// Convert to same format as BPF
+	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+	domainHash := hashDomain(domain)
+
+	key := IPDomainKey{
+		ClientIP:   ipKey,
+		DomainHash: domainHash,
+	}
+
+	var value uint8
+	err := p.objs.IpBlocklist.Lookup(&key, &value)
+	if err == nil && value == 1 {
+		log.Printf("Per-IP blocklist hit: IP=%s domain=%s hash=0x%x", clientIP, domain, domainHash)
+		return true
 	}
 
 	return false
