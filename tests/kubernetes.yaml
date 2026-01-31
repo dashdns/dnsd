@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashdns
+  labels:
+    app: dashdns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashdns
+  template:
+    metadata:
+      labels:
+        app: dashdns
+    spec:
+      containers:
+        - name: dashdns
+          image: emirozbir/dnsd:v1
+          command: ["/dashdns/dnsd"]
+          args:
+            - "-ip-blocklist=192.168.65.1:www.facebook.com"
+            - "-iface"
+            - "eth0"
+            - "-upstream=1.1.1.1:53"
+            - "-ip-blocklist-url=http://dns-mesh-controller-controller-manager-metrics-service.dns-mesh-controller-system:5959/api/policies"
+          ports:
+            - containerPort: 53
+              protocol: UDP
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - NET_ADMIN
+                - SYS_RESOURCE
+          volumeMounts:
+            - name: bpf
+              mountPath: /sys/fs/bpf
+            - name: debug
+              mountPath: /sys/kernel/debug
+              readOnly: true
+      volumes:
+        - name: bpf
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: debug
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashdns
+  labels:
+    app: dashdns
+spec:
+  type: NodePort
+  selector:
+    app: dashdns
+  ports:
+    - port: 53
+      targetPort: 53
+      nodePort: 30053
+      protocol: UDP
