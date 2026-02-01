@@ -6,7 +6,7 @@ revisionHistoryLimit: 3
 
 image:
   repository: emirozbir/dnsd
-  tag: "v1"
+  tag: "v1.0.0-rc"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -28,7 +28,7 @@ dns:
   # Per-IP blocklist in format: IP1:domain1,domain2;IP2:domain3
   ipBlocklist: ""
   # URL to fetch per-IP blocklist from (JSON format)
-  ipBlocklistUrl: ""
+  ipBlocklistUrl: "http://dns-mesh-stack-service.default:5959/api/policies"
   # Interval to refresh the remote IP blocklist
   ipBlocklistInterval: "5m"
 

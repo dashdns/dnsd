@@ -42,7 +42,7 @@ spec:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/dashdns/dnsd"]
+          command: ["/opt/dashdns/dnsd"]
           args:
             - "-iface={{ .Values.dns.interface }}"
             - "-upstream={{ .Values.dns.upstream }}"
