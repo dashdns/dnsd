@@ -18,8 +18,90 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/vishvananda/netlink"
 )
+
+var (
+	// XDP packet counters
+	metricXDPTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_xdp_packets_total",
+		Help: "Total packets seen by XDP program",
+	})
+	metricXDPDNSQueries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_xdp_dns_queries_total",
+		Help: "DNS query packets seen by XDP program",
+	})
+	metricXDPBlocked = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_xdp_blocked_total",
+		Help: "DNS queries blocked by XDP program",
+	})
+	metricXDPAllowed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_xdp_allowed_total",
+		Help: "DNS queries allowed by XDP program",
+	})
+
+	// TC response counters
+	metricTCDNSResponses = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_tc_dns_responses_total",
+		Help: "DNS responses seen by TC program",
+	})
+	metricTCBlockedResponses = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_tc_blocked_responses_total",
+		Help: "DNS responses blocked by TC program",
+	})
+	metricTCAllowedResponses = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_tc_allowed_responses_total",
+		Help: "DNS responses allowed by TC program",
+	})
+	metricTCIPBlockedResponses = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_tc_ip_blocked_responses_total",
+		Help: "DNS responses blocked by TC per-IP rules",
+	})
+
+	// BPF map entry counts
+	metricBlockedDomainsCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_blocked_domains_count",
+		Help: "Number of entries in blocked_domains BPF map",
+	})
+	metricBlockedIPsCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_blocked_ips_count",
+		Help: "Number of entries in blocked_ips BPF map",
+	})
+	metricBlockedDNSServersCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_blocked_dns_servers_count",
+		Help: "Number of entries in blocked_dns_servers BPF map",
+	})
+	metricIPBlocklistRulesCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_ip_blocklist_rules_count",
+		Help: "Number of entries in ip_blocklist BPF map",
+	})
+
+	// Per-source-IP blocked query counter
+	metricSourceBlocked = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "dnsd_source_blocked_total",
+		Help: "Total blocked queries per source IP",
+	}, []string{"source_ip"})
+)
+
+func init() {
+	prometheus.MustRegister(
+		metricXDPTotal,
+		metricXDPDNSQueries,
+		metricXDPBlocked,
+		metricXDPAllowed,
+		metricTCDNSResponses,
+		metricTCBlockedResponses,
+		metricTCAllowedResponses,
+		metricTCIPBlockedResponses,
+		metricBlockedDomainsCount,
+		metricBlockedIPsCount,
+		metricBlockedDNSServersCount,
+		metricIPBlocklistRulesCount,
+		metricSourceBlocked,
+	)
+}
 
 // IPBlocklistEntry represents a single entry in the remote blocklist
 type IPBlocklistEntry struct {
@@ -170,6 +252,15 @@ func main() {
 	log.Printf("DNS Proxy started on interface %s", *iface)
 	log.Printf("Upstream DNS: %s", *upstream)
 	log.Printf("Blocking %d domains", len(proxy.blockedDomains))
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		log.Printf("Prometheus metrics server listening on :9090/metrics")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			log.Fatalf("Failed to start metrics server: %v", err)
+		}
+	}()
 
 	go proxy.reportStats()
 
@@ -376,6 +467,10 @@ func (p *DNSProxy) BlockDNSServer(ipStr string) error {
 	return nil
 }
 
+func uint32ToIP(ip uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d", ip&0xFF, (ip>>8)&0xFF, (ip>>16)&0xFF, (ip>>24)&0xFF)
+}
+
 func hashDomain(domain string) uint32 { // for bpf side
 	hash := uint32(5381)
 	for _, c := range "." + strings.ToLower(domain) {
@@ -390,6 +485,7 @@ func (p *DNSProxy) reportStats() {
 
 	for range ticker.C {
 		var total, dnsPackets, blocked, allowed uint64
+		var dnsResponses, blockedResponses, allowedResponses, ipBlockedResponses uint64
 
 		key := uint32(0)
 		p.objs.Stats.Lookup(&key, &total)
@@ -403,8 +499,93 @@ func (p *DNSProxy) reportStats() {
 		key = uint32(3)
 		p.objs.Stats.Lookup(&key, &allowed)
 
-		log.Printf("Stats - Total: %d, DNS: %d, Blocked: %d, Allowed: %d",
+		key = uint32(4)
+		p.objs.Stats.Lookup(&key, &dnsResponses)
+
+		key = uint32(5)
+		p.objs.Stats.Lookup(&key, &blockedResponses)
+
+		key = uint32(6)
+		p.objs.Stats.Lookup(&key, &allowedResponses)
+
+		key = uint32(7)
+		p.objs.Stats.Lookup(&key, &ipBlockedResponses)
+
+		// Count BPF map entries
+		var blockedDomainsCount, blockedIPsCount, blockedDNSCount, ipBlocklistCount int
+		var domainKey uint32
+		var ipKey uint32
+		var ipDomainKey IPDomainKey
+		var val uint8
+
+		iter := p.objs.BlockedDomains.Iterate()
+		for iter.Next(&domainKey, &val) {
+			blockedDomainsCount++
+		}
+
+		var blockedIPsList []string
+		iter = p.objs.BlockedIps.Iterate()
+		for iter.Next(&ipKey, &val) {
+			blockedIPsCount++
+			blockedIPsList = append(blockedIPsList, uint32ToIP(ipKey))
+		}
+
+		var blockedDNSList []string
+		iter = p.objs.BlockedDnsServers.Iterate()
+		for iter.Next(&ipKey, &val) {
+			blockedDNSCount++
+			blockedDNSList = append(blockedDNSList, uint32ToIP(ipKey))
+		}
+
+		// Collect per-IP blocklist entries grouped by client IP
+		perIPEntries := make(map[string]int)
+		ipBlocklistIter := p.objs.IpBlocklist.Iterate()
+		for ipBlocklistIter.Next(&ipDomainKey, &val) {
+			ipBlocklistCount++
+			clientIP := uint32ToIP(ipDomainKey.ClientIP)
+			perIPEntries[clientIP]++
+		}
+
+		// Update Prometheus metrics
+		metricXDPTotal.Set(float64(total))
+		metricXDPDNSQueries.Set(float64(dnsPackets))
+		metricXDPBlocked.Set(float64(blocked))
+		metricXDPAllowed.Set(float64(allowed))
+		metricTCDNSResponses.Set(float64(dnsResponses))
+		metricTCBlockedResponses.Set(float64(blockedResponses))
+		metricTCAllowedResponses.Set(float64(allowedResponses))
+		metricTCIPBlockedResponses.Set(float64(ipBlockedResponses))
+		metricBlockedDomainsCount.Set(float64(blockedDomainsCount))
+		metricBlockedIPsCount.Set(float64(blockedIPsCount))
+		metricBlockedDNSServersCount.Set(float64(blockedDNSCount))
+		metricIPBlocklistRulesCount.Set(float64(ipBlocklistCount))
+
+		log.Printf("Stats [XDP] Total: %d | DNS queries: %d | Blocked: %d | Allowed: %d",
 			total, dnsPackets, blocked, allowed)
+		log.Printf("Stats [TC]  DNS responses: %d | Blocked: %d | Allowed: %d | Per-IP blocked: %d",
+			dnsResponses, blockedResponses, allowedResponses, ipBlockedResponses)
+		log.Printf("Stats [Maps] Blocked domains: %d | Blocked IPs: %d | Blocked DNS servers: %d | Per-IP rules: %d",
+			blockedDomainsCount, blockedIPsCount, blockedDNSCount, ipBlocklistCount)
+		if len(blockedIPsList) > 0 {
+			log.Printf("Stats [Blocked IPs] %s", strings.Join(blockedIPsList, ", "))
+		}
+		if len(blockedDNSList) > 0 {
+			log.Printf("Stats [Blocked DNS Servers] %s", strings.Join(blockedDNSList, ", "))
+		}
+		for clientIP, ruleCount := range perIPEntries {
+			log.Printf("Stats [Per-IP Blocklist] Client %s: %d domain rules", clientIP, ruleCount)
+		}
+
+		// Per-source-IP blocked query counts
+		metricSourceBlocked.Reset()
+		var srcIP uint32
+		var srcCount uint64
+		srcIter := p.objs.BlockedSrcStats.Iterate()
+		for srcIter.Next(&srcIP, &srcCount) {
+			srcIPStr := uint32ToIP(srcIP)
+			metricSourceBlocked.WithLabelValues(srcIPStr).Set(float64(srcCount))
+			log.Printf("Stats [Blocked Source] %s: %d queries blocked", srcIPStr, srcCount)
+		}
 	}
 }
 

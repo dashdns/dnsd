@@ -58,6 +58,14 @@ struct {
     __type(value, __u64);
 } stats SEC(".maps");
 
+// Per-source-IP blocked query counter
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);    // client IP (network byte order)
+    __type(value, __u64);  // block count
+} blocked_src_stats SEC(".maps");
+
 enum {
     STAT_TOTAL_PACKETS = 0,
     STAT_DNS_PACKETS = 1,
@@ -320,6 +328,14 @@ int xdp_dns_filter(struct xdp_md *ctx) {
     if (check_dns_query_blocked_xdp(data, data_end, dns_offset, client_ip)) {
         bpf_printk("XDP: >>> DROPPING DNS QUERY - IN BLOCKLIST <<<");
         update_stat(STAT_BLOCKED_PACKETS);
+        // Track per-source-IP blocked count
+        __u64 *src_count = bpf_map_lookup_elem(&blocked_src_stats, &client_ip);
+        if (src_count) {
+            __sync_fetch_and_add(src_count, 1);
+        } else {
+            __u64 init_val = 1;
+            bpf_map_update_elem(&blocked_src_stats, &client_ip, &init_val, BPF_ANY);
+        }
         return XDP_DROP;
     }
 
