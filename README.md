@@ -217,7 +217,10 @@ DNSD will automatically:
    - `blocked_ips`: IPs to block in DNS responses
    - `blocked_dns_servers`: Unauthorized DNS servers to block
 
-## Statistics
+## Monitoring
+
+
+### Basic Metrics
 
 DNSD reports statistics every 10 seconds:
 
@@ -230,13 +233,33 @@ Stats - Total: 1523, DNS: 342, Blocked: 45, Allowed: 297
 - **Blocked**: Queries blocked by eBPF
 - **Allowed**: Queries passed through
 
+### Grafana Monitoring
+
+The dnds daemon expose the metrics via `9090` port from `/metrics` endpoint.
+
+You can enable the servicemonitors via helm chart in dns-mesh-controller helm chart.
+
+```yaml
+dnsd:
+  prometheus:
+    enabled: true
+    serviceMonitorDiscoverLabels:
+      release: prometheus-operator
+```
+
+
+### Dashboard View
+
+<img src="./grafana/img/dashboard.png"></img>
+
+
 ## Roadmap
 
-- [ ] Support for XDP driver mode (qlink, skb, and generic mode selection)
+- [x] Support for XDP driver mode (qlink, skb, and generic mode selection)
 - [ ] IPv6 support
 - [ ] DNS over HTTPS (DoH) upstream support
 - [ ] Web-based management UI
-- [ ] Prometheus metrics endpoint
+- [x] Prometheus metrics endpoint
 
 ## License
 
