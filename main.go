@@ -23,6 +23,11 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const (
+	AWS_VPC_CNI = "aws-vpc-cni"
+	DEFAULT     = "onpremise"
+)
+
 var (
 	// XDP packet counters
 	metricXDPTotal = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -127,6 +132,7 @@ type DNSProxy struct {
 	ipBlocklistURL   string
 	ipBlocklistMu    sync.RWMutex
 	currentBlocklist []IPBlocklistEntry // track current entries for diffing
+	ipam             string
 }
 
 // IPDomainKey matches the BPF ip_domain_key struct
@@ -144,6 +150,8 @@ func main() {
 	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
 	ipBlocklistURL := flag.String("ip-blocklist-url", "", "URL to fetch per-IP blocklist from (JSON format)")
 	ipBlocklistInterval := flag.Duration("ip-blocklist-interval", 5*time.Minute, "Interval to refresh the remote IP blocklist")
+	ipam := flag.String("ipam", "onpremise", "The identifer which gives details for CNI ipam usage.")
+
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -157,6 +165,7 @@ func main() {
 		dnsClient:        &dns.Client{Net: "udp", Timeout: 5 * time.Second},
 		ipBlocklistURL:   *ipBlocklistURL,
 		currentBlocklist: []IPBlocklistEntry{},
+		ipam:             *ipam,
 	}
 
 	if *blocklist != "" {
@@ -168,10 +177,37 @@ func main() {
 			}
 		}
 	}
+	LOADED_EBPF_PROGRAMS := 0
+	switch *ipam {
+	case AWS_VPC_CNI:
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			fmt.Errorf("Error while fetching interfaces", err)
+			os.Exit(1)
+		}
 
-	if err := proxy.loadBPF(); err != nil {
-		log.Fatalf("Failed to load eBPF programs: %v", err)
+		// loading bpf programs to specific interfaces
+		for i := 0; i < len(interfaces); i++ {
+			intf := interfaces[i]
+			if strings.Contains(intf.Name, "eni") {
+				if err := proxy.loadBPF(intf.Name); err != nil {
+					log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, intf.Name)
+				} else {
+					LOADED_EBPF_PROGRAMS = LOADED_EBPF_PROGRAMS + 1
+				}
+			}
+		}
+
+		if LOADED_EBPF_PROGRAMS == 0 {
+			log.Printf("The load ebpf program count if zero no attachement on node level, skipping runtime, shutting down DashDNS daemon...")
+			os.Exit(0)
+		}
+	default:
+		if err := proxy.loadBPF("eth0"); err != nil {
+			log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, "eth0")
+		}
 	}
+
 	defer proxy.cleanup()
 
 	if err := proxy.updateBlocklist(); err != nil {
@@ -273,7 +309,7 @@ func main() {
 	log.Println("Shutting down...")
 }
 
-func (p *DNSProxy) loadBPF() error {
+func (p *DNSProxy) loadBPF(eth string) error {
 	objs := &bpfObjects{}
 	opts := &ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
@@ -285,7 +321,7 @@ func (p *DNSProxy) loadBPF() error {
 	}
 	p.objs = objs
 
-	iface, err := net.InterfaceByName(p.iface)
+	iface, err := net.InterfaceByName(eth)
 	if err != nil {
 		return fmt.Errorf("getting interface %s: %w", p.iface, err)
 	}
