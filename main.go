@@ -177,31 +177,29 @@ func main() {
 			}
 		}
 	}
-	LOADED_EBPF_PROGRAMS := 0
 	switch *ipam {
 	case AWS_VPC_CNI:
 		interfaces, err := net.Interfaces()
 		if err != nil {
-			fmt.Errorf("Error while fetching interfaces", err)
-			os.Exit(1)
+			log.Fatalf("Error while fetching interfaces: %v", err)
 		}
 
-		// loading bpf programs to specific interfaces
-		for i := 0; i < len(interfaces); i++ {
-			intf := interfaces[i]
+		loaded := 0
+		for _, intf := range interfaces {
 			if strings.Contains(intf.Name, "eni") {
 				if err := proxy.loadBPF(intf.Name); err != nil {
-					log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, intf.Name)
+					log.Printf("Failed to load eBPF on existing interface %s: %v", intf.Name, err)
 				} else {
-					LOADED_EBPF_PROGRAMS = LOADED_EBPF_PROGRAMS + 1
+					loaded++
 				}
 			}
 		}
 
-		if LOADED_EBPF_PROGRAMS == 0 {
-			log.Printf("The load ebpf program count if zero no attachement on node level, skipping runtime, shutting down DashDNS daemon...")
-			os.Exit(0)
+		if loaded == 0 {
+			log.Printf("No ENI interfaces found on startup, watching for new ones...")
 		}
+
+		go proxy.watchENIInterfaces()
 	default:
 		if err := proxy.loadBPF("eth0"); err != nil {
 			log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, "eth0")
@@ -342,6 +340,28 @@ func (p *DNSProxy) loadBPF(eth string) error {
 	}
 
 	return nil
+}
+
+func (p *DNSProxy) watchENIInterfaces() {
+	updates := make(chan netlink.LinkUpdate)
+	done := make(chan struct{})
+
+	if err := netlink.LinkSubscribe(updates, done); err != nil {
+		log.Printf("Failed to subscribe to network interface changes: %v", err)
+		return
+	}
+	defer close(done)
+
+	log.Printf("Watching for new ENI interfaces...")
+	for update := range updates {
+		if update.Header.Type == syscall.RTM_NEWLINK && strings.Contains(update.Link.Attrs().Name, "eni") {
+			name := update.Link.Attrs().Name
+			log.Printf("New ENI interface detected: %s, attaching eBPF programs", name)
+			if err := p.loadBPF(name); err != nil {
+				log.Printf("Failed to load eBPF on new interface %s: %v", name, err)
+			}
+		}
+	}
 }
 
 func (p *DNSProxy) attachTC(ifaceIndex int) error {
