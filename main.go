@@ -23,6 +23,11 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const (
+	AWS_VPC_CNI = "aws-vpc-cni"
+	DEFAULT     = "onpremise"
+)
+
 var (
 	// XDP packet counters
 	metricXDPTotal = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -127,6 +132,7 @@ type DNSProxy struct {
 	ipBlocklistURL   string
 	ipBlocklistMu    sync.RWMutex
 	currentBlocklist []IPBlocklistEntry // track current entries for diffing
+	ipam             string
 }
 
 // IPDomainKey matches the BPF ip_domain_key struct
@@ -144,6 +150,8 @@ func main() {
 	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
 	ipBlocklistURL := flag.String("ip-blocklist-url", "", "URL to fetch per-IP blocklist from (JSON format)")
 	ipBlocklistInterval := flag.Duration("ip-blocklist-interval", 5*time.Minute, "Interval to refresh the remote IP blocklist")
+	ipam := flag.String("ipam", "onpremise", "The identifer which gives details for CNI ipam usage.")
+
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -157,6 +165,7 @@ func main() {
 		dnsClient:        &dns.Client{Net: "udp", Timeout: 5 * time.Second},
 		ipBlocklistURL:   *ipBlocklistURL,
 		currentBlocklist: []IPBlocklistEntry{},
+		ipam:             *ipam,
 	}
 
 	if *blocklist != "" {
@@ -168,10 +177,35 @@ func main() {
 			}
 		}
 	}
+	switch *ipam {
+	case AWS_VPC_CNI:
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			log.Fatalf("Error while fetching interfaces: %v", err)
+		}
 
-	if err := proxy.loadBPF(); err != nil {
-		log.Fatalf("Failed to load eBPF programs: %v", err)
+		loaded := 0
+		for _, intf := range interfaces {
+			if strings.Contains(intf.Name, "eni") {
+				if err := proxy.loadBPF(intf.Name); err != nil {
+					log.Printf("Failed to load eBPF on existing interface %s: %v", intf.Name, err)
+				} else {
+					loaded++
+				}
+			}
+		}
+
+		if loaded == 0 {
+			log.Printf("No ENI interfaces found on startup, watching for new ones...")
+		}
+
+		go proxy.watchENIInterfaces()
+	default:
+		if err := proxy.loadBPF("eth0"); err != nil {
+			log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, "eth0")
+		}
 	}
+
 	defer proxy.cleanup()
 
 	if err := proxy.updateBlocklist(); err != nil {
@@ -273,7 +307,7 @@ func main() {
 	log.Println("Shutting down...")
 }
 
-func (p *DNSProxy) loadBPF() error {
+func (p *DNSProxy) loadBPF(eth string) error {
 	objs := &bpfObjects{}
 	opts := &ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
@@ -285,7 +319,7 @@ func (p *DNSProxy) loadBPF() error {
 	}
 	p.objs = objs
 
-	iface, err := net.InterfaceByName(p.iface)
+	iface, err := net.InterfaceByName(eth)
 	if err != nil {
 		return fmt.Errorf("getting interface %s: %w", p.iface, err)
 	}
@@ -306,6 +340,28 @@ func (p *DNSProxy) loadBPF() error {
 	}
 
 	return nil
+}
+
+func (p *DNSProxy) watchENIInterfaces() {
+	updates := make(chan netlink.LinkUpdate)
+	done := make(chan struct{})
+
+	if err := netlink.LinkSubscribe(updates, done); err != nil {
+		log.Printf("Failed to subscribe to network interface changes: %v", err)
+		return
+	}
+	defer close(done)
+
+	log.Printf("Watching for new ENI interfaces...")
+	for update := range updates {
+		if update.Header.Type == syscall.RTM_NEWLINK && strings.Contains(update.Link.Attrs().Name, "eni") {
+			name := update.Link.Attrs().Name
+			log.Printf("New ENI interface detected: %s, attaching eBPF programs", name)
+			if err := p.loadBPF(name); err != nil {
+				log.Printf("Failed to load eBPF on new interface %s: %v", name, err)
+			}
+		}
+	}
 }
 
 func (p *DNSProxy) attachTC(ifaceIndex int) error {
