@@ -183,10 +183,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error while fetching interfaces: %v", err)
 		}
-
+		fmt.Println("The list of interfaces", interfaces)
 		loaded := 0
 		for _, intf := range interfaces {
-			if strings.Contains(intf.Name, "eni") {
+			if strings.Contains(intf.Name, "ens") {
 				if err := proxy.loadBPF(intf.Name); err != nil {
 					log.Printf("Failed to load eBPF on existing interface %s: %v", intf.Name, err)
 				} else {
