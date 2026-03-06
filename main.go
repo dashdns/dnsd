@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +20,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -135,6 +139,7 @@ type DNSProxy struct {
 	currentBlocklist []IPBlocklistEntry // track current entries for diffing
 	ipam             string
 	linkTypeMap      map[string]link.XDPAttachFlags
+	ringReader       *ringbuf.Reader
 }
 
 // IPDomainKey matches the BPF ip_domain_key struct
@@ -142,6 +147,23 @@ type IPDomainKey struct {
 	ClientIP   uint32
 	DomainHash uint32
 }
+
+// LogEvent matches the BPF log_event struct (28 bytes)
+type LogEvent struct {
+	TimestampNs uint64
+	SrcIP       uint32
+	DstIP       uint32
+	DomainHash  uint32
+	SrcPort     uint16
+	DstPort     uint16
+	Action      uint8
+	Pad         [3]byte
+}
+
+const (
+	logActionAllowed = uint8(0)
+	logActionBlocked = uint8(1)
+)
 
 func main() {
 	iface := flag.String("iface", "lo", "Network interface to attach XDP/TC programs")
@@ -347,6 +369,8 @@ func (p *DNSProxy) loadBPF(eth string, linkMode *string) error {
 	if err := p.attachTC(iface.Index); err != nil {
 		return fmt.Errorf("attaching TC program: %w", err)
 	}
+
+	p.startRingBufReader()
 
 	return nil
 }
@@ -654,6 +678,41 @@ func (p *DNSProxy) reportStats() {
 	}
 }
 
+func (p *DNSProxy) startRingBufReader() {
+	rd, err := ringbuf.NewReader(p.objs.Rb)
+	if err != nil {
+		log.Printf("Failed to open ring buffer reader: %v", err)
+		return
+	}
+	p.ringReader = rd
+
+	go func() {
+		var event LogEvent
+		for {
+			record, err := rd.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return
+				}
+				log.Printf("Ring buffer read error: %v", err)
+				continue
+			}
+			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+				log.Printf("Failed to decode ring buffer event: %v", err)
+				continue
+			}
+
+			srcIP := uint32ToIP(event.SrcIP)
+			action := "ALLOWED"
+			if event.Action == logActionBlocked {
+				action = "BLOCKED"
+			}
+			log.Printf("[BPF] %s src=%s:%d domain_hash=0x%x",
+				action, srcIP, event.SrcPort, event.DomainHash)
+		}
+	}()
+}
+
 func (p *DNSProxy) startDNSServer() {
 	server := &dns.Server{
 		Addr: "0.0.0.0:53",
@@ -766,6 +825,10 @@ func (p *DNSProxy) isBlockedForIP(clientIP, domain string) bool {
 }
 
 func (p *DNSProxy) cleanup() {
+	if p.ringReader != nil {
+		p.ringReader.Close()
+	}
+
 	if p.xdpLink != nil {
 		p.xdpLink.Close()
 	}
