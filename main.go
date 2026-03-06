@@ -26,6 +26,7 @@ import (
 const (
 	AWS_VPC_CNI = "aws-vpc-cni"
 	DEFAULT     = "onpremise"
+	LINK_MODE   = ""
 )
 
 var (
@@ -133,6 +134,7 @@ type DNSProxy struct {
 	ipBlocklistMu    sync.RWMutex
 	currentBlocklist []IPBlocklistEntry // track current entries for diffing
 	ipam             string
+	linkTypeMap      map[string]link.XDPAttachFlags
 }
 
 // IPDomainKey matches the BPF ip_domain_key struct
@@ -150,6 +152,7 @@ func main() {
 	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
 	ipBlocklistURL := flag.String("ip-blocklist-url", "", "URL to fetch per-IP blocklist from (JSON format)")
 	ipBlocklistInterval := flag.Duration("ip-blocklist-interval", 5*time.Minute, "Interval to refresh the remote IP blocklist")
+	linkMode := flag.String("link-mode", "generic", "The type of links while attaching XDP programs")
 	ipam := flag.String("ipam", "onpremise", "The identifer which gives details for CNI ipam usage.")
 
 	flag.Parse()
@@ -157,6 +160,10 @@ func main() {
 	if os.Geteuid() != 0 {
 		log.Fatal("This program must be run as root")
 	}
+	linkTypeMap := make(map[string]link.XDPAttachFlags)
+	linkTypeMap["generic"] = link.XDPGenericMode
+	linkTypeMap["driver"] = link.XDPDriverMode
+	linkTypeMap["offload"] = link.XDPOffloadMode
 
 	proxy := &DNSProxy{
 		iface:            *iface,
@@ -165,6 +172,7 @@ func main() {
 		dnsClient:        &dns.Client{Net: "udp", Timeout: 5 * time.Second},
 		ipBlocklistURL:   *ipBlocklistURL,
 		currentBlocklist: []IPBlocklistEntry{},
+		linkTypeMap:      linkTypeMap,
 		ipam:             *ipam,
 	}
 
@@ -177,6 +185,7 @@ func main() {
 			}
 		}
 	}
+
 	switch *ipam {
 	case AWS_VPC_CNI:
 		interfaces, err := net.Interfaces()
@@ -187,7 +196,7 @@ func main() {
 		loaded := 0
 		for _, intf := range interfaces {
 			if strings.Contains(intf.Name, "ens") {
-				if err := proxy.loadBPF(intf.Name); err != nil {
+				if err := proxy.loadBPF(intf.Name, linkMode); err != nil {
 					log.Printf("Failed to load eBPF on existing interface %s: %v", intf.Name, err)
 				} else {
 					loaded++
@@ -199,9 +208,9 @@ func main() {
 			log.Printf("No ENI interfaces found on startup, watching for new ones...")
 		}
 
-		go proxy.watchENIInterfaces()
+		go proxy.watchENIInterfaces(linkMode)
 	default:
-		if err := proxy.loadBPF("eth0"); err != nil {
+		if err := proxy.loadBPF("eth0", linkMode); err != nil {
 			log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, "eth0")
 		}
 	}
@@ -307,7 +316,7 @@ func main() {
 	log.Println("Shutting down...")
 }
 
-func (p *DNSProxy) loadBPF(eth string) error {
+func (p *DNSProxy) loadBPF(eth string, linkMode *string) error {
 	objs := &bpfObjects{}
 	opts := &ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
@@ -327,7 +336,7 @@ func (p *DNSProxy) loadBPF(eth string) error {
 	xdpLink, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpDnsFilter,
 		Interface: iface.Index,
-		Flags:     link.XDPGenericMode,
+		Flags:     p.linkTypeMap[*linkMode],
 	})
 	if err != nil {
 		return fmt.Errorf("attaching XDP program: %w", err)
@@ -342,7 +351,7 @@ func (p *DNSProxy) loadBPF(eth string) error {
 	return nil
 }
 
-func (p *DNSProxy) watchENIInterfaces() {
+func (p *DNSProxy) watchENIInterfaces(linkMode *string) {
 	updates := make(chan netlink.LinkUpdate)
 	done := make(chan struct{})
 
@@ -357,7 +366,7 @@ func (p *DNSProxy) watchENIInterfaces() {
 		if update.Header.Type == syscall.RTM_NEWLINK && strings.Contains(update.Link.Attrs().Name, "eni") {
 			name := update.Link.Attrs().Name
 			log.Printf("New ENI interface detected: %s, attaching eBPF programs", name)
-			if err := p.loadBPF(name); err != nil {
+			if err := p.loadBPF(name, linkMode); err != nil {
 				log.Printf("Failed to load eBPF on new interface %s: %v", name, err)
 			}
 		}
