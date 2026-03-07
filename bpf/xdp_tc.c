@@ -93,6 +93,26 @@ struct dns_header {
     __u16 arcount;
 };
 
+#define ACTION_ALLOWED 0
+#define ACTION_BLOCKED 1
+
+struct log_event {
+    __u64 timestamp_ns;
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u32 domain_hash;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  action;
+    __u8  pad[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+
+
 // Hash a single byte and update hash value
 #define HASH_CHAR(qname, i, hash, done_flag) do { \
     if (!(done_flag) && (void *)&(qname)[i+1] <= data_end) { \
@@ -109,7 +129,9 @@ struct dns_header {
 
 // Check if domain is blocked for the given client IP
 // Returns: 1 = should block (in blocklist), 0 = allowed
-static __always_inline int check_dns_query_blocked_xdp(void *data, void *data_end, __u32 dns_offset, __u32 client_ip) {
+static __always_inline int check_dns_query_blocked_xdp(void *data, void *data_end, __u32 dns_offset, __u32 client_ip, __u32 *out_hash) {
+    *out_hash = 0;
+
     // Calculate qname position (after DNS header)
     unsigned char *qname = data + dns_offset + sizeof(struct dns_header);
 
@@ -158,6 +180,8 @@ static __always_inline int check_dns_query_blocked_xdp(void *data, void *data_en
     HASH_CHAR(qname, 58, hash, done); HASH_CHAR(qname, 59, hash, done);
     HASH_CHAR(qname, 60, hash, done); HASH_CHAR(qname, 61, hash, done);
     HASH_CHAR(qname, 62, hash, done); HASH_CHAR(qname, 63, hash, done);
+
+    *out_hash = hash;
 
     bpf_printk("XDP: client_ip=0x%x", client_ip);
     bpf_printk("XDP: domain_hash=0x%x", hash);
@@ -324,8 +348,9 @@ int xdp_dns_filter(struct xdp_md *ctx) {
     __u32 client_ip = ip->saddr;  // Source IP of the DNS query
 
     // Per-IP and global blocklist check (default: allow all)
+    __u32 domain_hash = 0;
     bpf_printk("XDP: >>> CHecking Blocking status IP client_ip=0x%x  domain_hash=0x%x<<<", client_ip, dns_offset);
-    if (check_dns_query_blocked_xdp(data, data_end, dns_offset, client_ip)) {
+    if (check_dns_query_blocked_xdp(data, data_end, dns_offset, client_ip, &domain_hash)) {
         bpf_printk("XDP: >>> DROPPING DNS QUERY - IN BLOCKLIST <<<");
         update_stat(STAT_BLOCKED_PACKETS);
         // Track per-source-IP blocked count
@@ -335,6 +360,18 @@ int xdp_dns_filter(struct xdp_md *ctx) {
         } else {
             __u64 init_val = 1;
             bpf_map_update_elem(&blocked_src_stats, &client_ip, &init_val, BPF_ANY);
+        }
+        struct log_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+        if (e) {
+            e->timestamp_ns = bpf_ktime_get_ns();
+            e->src_ip = ip->saddr;
+            e->dst_ip = ip->daddr;
+            e->domain_hash = domain_hash;
+            e->src_port = bpf_ntohs(udp->source);
+            e->dst_port = bpf_ntohs(udp->dest);
+            e->action = ACTION_BLOCKED;
+            e->pad[0] = 0; e->pad[1] = 0; e->pad[2] = 0;
+            bpf_ringbuf_submit(e, 0);
         }
         return XDP_DROP;
     }
