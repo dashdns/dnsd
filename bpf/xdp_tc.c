@@ -361,6 +361,8 @@ int xdp_dns_filter(struct xdp_md *ctx) {
             __u64 init_val = 1;
             bpf_map_update_elem(&blocked_src_stats, &client_ip, &init_val, BPF_ANY);
         }
+
+        const char* log_level_var;
         struct log_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
         if (e) {
             e->timestamp_ns = bpf_ktime_get_ns();
@@ -374,9 +376,20 @@ int xdp_dns_filter(struct xdp_md *ctx) {
             bpf_ringbuf_submit(e, 0);
         }
         return XDP_DROP;
+    }else{
+         struct log_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+         if (e) {
+            e->timestamp_ns = bpf_ktime_get_ns();
+            e->src_ip = ip->saddr;
+            e->dst_ip = ip->daddr;
+            e->domain_hash = domain_hash;
+            e->src_port = bpf_ntohs(udp->source);
+            e->dst_port = bpf_ntohs(udp->dest);
+            e->action = ACTION_ALLOWED;
+            e->pad[0] = 0; e->pad[1] = 0; e->pad[2] = 0;
+            bpf_ringbuf_submit(e, 0);
+        }
     }
-
-    bpf_printk("XDP: DNS query PASSED (not in blocklist)");
     update_stat(STAT_ALLOWED_PACKETS);
     return XDP_PASS;
 }
