@@ -8,6 +8,7 @@ DNSD is a high-performance DNS proxy that leverages eBPF (Extended Berkeley Pack
 - **Global Domain Blocking**: Block domains for all clients
 - **Per-IP Domain Blocking**: Apply different blocking rules per client IP address
 - **Dynamic Policy Management**: Fetch and auto-refresh blocking policies from a remote API endpoint
+- **Conditional Resolver**: Define conditional reserver address for each type of address regex expressions.
 - **DNS Server Blocking**: Prevent clients from using unauthorized DNS servers
 - **IP Response Blocking**: Block specific IPs from appearing in DNS responses
 - **Real-time Statistics**: Monitor packet counts, blocked queries, and allowed queries
@@ -138,6 +139,8 @@ spec:
             - "-iface=eth0"
             - "-upstream=1.1.1.1:53"
             - "-ip-blocklist-url=http://policy-controller:5959/api/policies"
+            - "-ip-blocklist-url=http://policy-controller:5959/api/policies"
+            - --upstream-rules="*.privatelink.*.aws.net=168.63.129.16:53;*.internal.corp=10.0.0.1:53;*.google.com=1.1.1.1"
           ports:
             - containerPort: 53
               protocol: UDP

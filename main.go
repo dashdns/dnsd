@@ -119,6 +119,13 @@ type IPBlocklistEntry struct {
 	Domains []string `json:"domains"`
 }
 
+// UpstreamRule maps a glob domain pattern to a specific upstream DNS server.
+// A single "*" matches exactly one label; "default" is the catch-all fallback.
+type UpstreamRule struct {
+	Pattern  string // e.g. "*.privatelink.*.windows.net"
+	Upstream string // e.g. "168.63.129.16:53"
+}
+
 // IPBlocklistResponse represents the JSON response from the remote blocklist endpoint
 type IPBlocklistResponse struct {
 	Blocklist []IPBlocklistEntry `json:"blocklist"`
@@ -129,6 +136,7 @@ type IPBlocklistResponse struct {
 type DNSProxy struct {
 	iface            string
 	upstreamDNS      string
+	upstreamRules    []UpstreamRule
 	xdpLink          link.Link
 	tcLink           link.Link
 	objs             *bpfObjects
@@ -136,7 +144,7 @@ type DNSProxy struct {
 	dnsClient        *dns.Client
 	ipBlocklistURL   string
 	ipBlocklistMu    sync.RWMutex
-	currentBlocklist []IPBlocklistEntry // track current entries for diffing
+	currentBlocklist []IPBlocklistEntry
 	ipam             string
 	linkTypeMap      map[string]link.XDPAttachFlags
 	ringReader       *ringbuf.Reader
@@ -167,7 +175,8 @@ const (
 
 func main() {
 	iface := flag.String("iface", "lo", "Network interface to attach XDP/TC programs")
-	upstream := flag.String("upstream", "8.8.8.8:53", "Upstream DNS server")
+	upstream := flag.String("upstream", "8.8.8.8:53", "Upstream DNS server (default fallback)")
+	upstreamRulesFlag := flag.String("upstream-rules", "", "Conditional upstream rules. Format: 'pattern=host:port;pattern2=host2:port2' (e.g., '*.privatelink.*.windows.net=168.63.129.16:53')")
 	blocklist := flag.String("blocklist", "", "Comma-separated list of domains to block globally")
 	blockips := flag.String("blockips", "", "Comma-separated list of IPs to block in DNS responses")
 	blockedDNS := flag.String("blocked-dns", "", "Comma-separated list of blocked DNS server IPs")
@@ -302,6 +311,28 @@ func main() {
 
 	if blockedDNSCount > 0 {
 		log.Printf("DNS server blocklist active: %d DNS server(s) blocked", blockedDNSCount)
+	}
+
+	// Parse conditional upstream rules
+	if *upstreamRulesFlag != "" {
+		for _, entry := range strings.Split(*upstreamRulesFlag, ";") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			parts := strings.SplitN(entry, "=", 2)
+			if len(parts) != 2 {
+				log.Printf("Warning: invalid upstream rule format: %s (expected pattern=host:port)", entry)
+				continue
+			}
+			pattern := strings.TrimSpace(parts[0])
+			upstreamAddr := strings.TrimSpace(parts[1])
+			proxy.upstreamRules = append(proxy.upstreamRules, UpstreamRule{
+				Pattern:  pattern,
+				Upstream: upstreamAddr,
+			})
+			log.Printf("Upstream rule: %s -> %s", pattern, upstreamAddr)
+		}
 	}
 
 	// Start remote IP blocklist fetcher if URL is provided
@@ -761,7 +792,12 @@ func (p *DNSProxy) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		}
 	}
 
-	resp, _, err := p.dnsClient.Exchange(r, p.upstreamDNS)
+	qname := ""
+	if len(r.Question) > 0 {
+		qname = r.Question[0].Name
+	}
+	upstream := p.selectUpstream(qname)
+	resp, _, err := p.dnsClient.Exchange(r, upstream)
 	if err != nil {
 		log.Printf("Error forwarding DNS query: %v", err)
 		m := new(dns.Msg)
@@ -771,6 +807,38 @@ func (p *DNSProxy) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	w.WriteMsg(resp)
+}
+
+// selectUpstream returns the upstream DNS server for the given domain.
+// Rules are evaluated in order; the first match wins. Falls back to p.upstreamDNS.
+func (p *DNSProxy) selectUpstream(domain string) string {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	for _, rule := range p.upstreamRules {
+		if matchGlobDomain(rule.Pattern, domain) {
+			log.Printf("Upstream routing: %s -> %s (rule: %s)", domain, rule.Upstream, rule.Pattern)
+			return rule.Upstream
+		}
+	}
+	return p.upstreamDNS
+}
+
+// matchGlobDomain matches a domain against a pattern where "*" matches exactly one label.
+// Example: "*.privatelink.*.windows.net" matches "foo.privatelink.bar.windows.net".
+func matchGlobDomain(pattern, domain string) bool {
+	patternParts := strings.Split(strings.ToLower(pattern), ".")
+	domainParts := strings.Split(domain, ".")
+	if len(patternParts) != len(domainParts) {
+		return false
+	}
+	for i, p := range patternParts {
+		if p == "*" {
+			continue
+		}
+		if p != domainParts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *DNSProxy) isBlocked(domain string) bool {
