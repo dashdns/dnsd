@@ -51,22 +51,6 @@ struct {
     __type(value, __u8);
 } blocked_dns_servers SEC(".maps");
 
-// Allowed DNS servers for leak guard (only enforced when dns_leak_guard is enabled)
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 100);
-    __type(key, __u32);
-    __type(value, __u8);
-} allowed_dns_servers SEC(".maps");
-
-// DNS leak guard enable flag: array[0] = 1 means drop all DNS not in allowed_dns_servers
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u8);
-} dns_leak_guard SEC(".maps");
-
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 8);
@@ -456,7 +440,7 @@ int tc_dns_filter(struct __sk_buff *skb) {
 
     update_stat(STAT_DNS_PACKETS);
 
-    // Check if DNS server is blocked (blacklist mode)
+    // Check if DNS server is blocked (default: allow all)
     __u8 *blocked = bpf_map_lookup_elem(&blocked_dns_servers, &dest_ip);
 
     if (blocked && *blocked == 1) {
@@ -464,32 +448,7 @@ int tc_dns_filter(struct __sk_buff *skb) {
         update_stat(STAT_BLOCKED_PACKETS);
         return TC_ACT_SHOT;
     }
-
-    // DNS leak guard (allowlist mode): drop all DNS queries not destined for an approved server
-    __u32 guard_key = 0;
-    __u8 *guard_enabled = bpf_map_lookup_elem(&dns_leak_guard, &guard_key);
-    if (guard_enabled && *guard_enabled == 1) {
-        __u8 *allowed = bpf_map_lookup_elem(&allowed_dns_servers, &dest_ip);
-        if (!allowed || *allowed != 1) {
-            bpf_printk("TC: DNS LEAK BLOCKED - destination not in allowed DNS servers");
-            update_stat(STAT_BLOCKED_PACKETS);
-            struct log_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-            if (e) {
-                e->timestamp_ns = bpf_ktime_get_ns();
-                e->src_ip = ip->saddr;
-                e->dst_ip = dest_ip;
-                e->domain_hash = 0;
-                e->src_port = bpf_ntohs(udp->source);
-                e->dst_port = DNS_PORT;
-                e->action = ACTION_BLOCKED;
-                e->pad[0] = 0; e->pad[1] = 0; e->pad[2] = 0;
-                bpf_ringbuf_submit(e, 0);
-            }
-            return TC_ACT_SHOT;
-        }
-    }
-
-    bpf_printk("TC: DNS query ALLOWED");
+    bpf_printk("TC: DNS query ALLOWED (DNS server not in blocklist)");
     update_stat(STAT_ALLOWED_PACKETS);
     return TC_ACT_OK;
 }
