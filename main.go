@@ -83,14 +83,6 @@ var (
 		Name: "dnsd_blocked_dns_servers_count",
 		Help: "Number of entries in blocked_dns_servers BPF map",
 	})
-	metricAllowedDNSServersCount = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "dnsd_allowed_dns_servers_count",
-		Help: "Number of entries in allowed_dns_servers BPF map",
-	})
-	metricLeakGuardEnabled = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "dnsd_leak_guard_enabled",
-		Help: "1 if DNS leak guard (allowlist mode) is active, 0 otherwise",
-	})
 	metricIPBlocklistRulesCount = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "dnsd_ip_blocklist_rules_count",
 		Help: "Number of entries in ip_blocklist BPF map",
@@ -116,8 +108,6 @@ func init() {
 		metricBlockedDomainsCount,
 		metricBlockedIPsCount,
 		metricBlockedDNSServersCount,
-		metricAllowedDNSServersCount,
-		metricLeakGuardEnabled,
 		metricIPBlocklistRulesCount,
 		metricSourceBlocked,
 	)
@@ -190,7 +180,6 @@ func main() {
 	blocklist := flag.String("blocklist", "", "Comma-separated list of domains to block globally")
 	blockips := flag.String("blockips", "", "Comma-separated list of IPs to block in DNS responses")
 	blockedDNS := flag.String("blocked-dns", "", "Comma-separated list of blocked DNS server IPs")
-	allowedDNS := flag.String("allowed-dns", "", "Comma-separated list of allowed DNS server IPs (enables leak guard: all other DNS traffic is dropped)")
 	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
 	ipBlocklistURL := flag.String("ip-blocklist-url", "", "URL to fetch per-IP blocklist from (JSON format)")
 	ipBlocklistInterval := flag.Duration("ip-blocklist-interval", 5*time.Minute, "Interval to refresh the remote IP blocklist")
@@ -322,26 +311,6 @@ func main() {
 
 	if blockedDNSCount > 0 {
 		log.Printf("DNS server blocklist active: %d DNS server(s) blocked", blockedDNSCount)
-	}
-
-	allowedDNSCount := 0
-	if *allowedDNS != "" {
-		for _, ip := range strings.Split(*allowedDNS, ",") {
-			ip = strings.TrimSpace(ip)
-			if ip != "" {
-				if err := proxy.AllowDNSServer(ip); err != nil {
-					log.Printf("Warning: %v", err)
-				} else {
-					allowedDNSCount++
-				}
-			}
-		}
-		if allowedDNSCount > 0 {
-			if err := proxy.EnableLeakGuard(); err != nil {
-				log.Fatalf("Failed to enable DNS leak guard: %v", err)
-			}
-			log.Printf("DNS leak guard ENABLED: only traffic to %d approved DNS server(s) allowed, all other DNS dropped", allowedDNSCount)
-		}
 	}
 
 	// Parse conditional upstream rules
@@ -618,37 +587,6 @@ func (p *DNSProxy) BlockDNSServer(ipStr string) error {
 	return nil
 }
 
-func (p *DNSProxy) AllowDNSServer(ipStr string) error {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return fmt.Errorf("invalid IP address: %s", ipStr)
-	}
-
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return fmt.Errorf("only IPv4 supported: %s", ipStr)
-	}
-
-	ipKey := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
-	value := uint8(1)
-
-	if err := p.objs.AllowedDnsServers.Put(&ipKey, &value); err != nil {
-		return fmt.Errorf("allowing DNS server %s: %w", ipStr, err)
-	}
-
-	log.Printf("Allowed DNS server: %s", ipStr)
-	return nil
-}
-
-func (p *DNSProxy) EnableLeakGuard() error {
-	key := uint32(0)
-	value := uint8(1)
-	if err := p.objs.DnsLeakGuard.Put(&key, &value); err != nil {
-		return fmt.Errorf("enabling DNS leak guard: %w", err)
-	}
-	return nil
-}
-
 func uint32ToIP(ip uint32) string {
 	return fmt.Sprintf("%d.%d.%d.%d", ip&0xFF, (ip>>8)&0xFF, (ip>>16)&0xFF, (ip>>24)&0xFF)
 }
@@ -694,7 +632,7 @@ func (p *DNSProxy) reportStats() {
 		p.objs.Stats.Lookup(&key, &ipBlockedResponses)
 
 		// Count BPF map entries
-		var blockedDomainsCount, blockedIPsCount, blockedDNSCount, allowedDNSCount, ipBlocklistCount int
+		var blockedDomainsCount, blockedIPsCount, blockedDNSCount, ipBlocklistCount int
 		var domainKey uint32
 		var ipKey uint32
 		var ipDomainKey IPDomainKey
@@ -719,17 +657,6 @@ func (p *DNSProxy) reportStats() {
 			blockedDNSList = append(blockedDNSList, uint32ToIP(ipKey))
 		}
 
-		var allowedDNSList []string
-		iter = p.objs.AllowedDnsServers.Iterate()
-		for iter.Next(&ipKey, &val) {
-			allowedDNSCount++
-			allowedDNSList = append(allowedDNSList, uint32ToIP(ipKey))
-		}
-
-		var leakGuardFlag uint8
-		leakGuardKey := uint32(0)
-		p.objs.DnsLeakGuard.Lookup(&leakGuardKey, &leakGuardFlag)
-
 		// Collect per-IP blocklist entries grouped by client IP
 		perIPEntries := make(map[string]int)
 		ipBlocklistIter := p.objs.IpBlocklist.Iterate()
@@ -751,24 +678,19 @@ func (p *DNSProxy) reportStats() {
 		metricBlockedDomainsCount.Set(float64(blockedDomainsCount))
 		metricBlockedIPsCount.Set(float64(blockedIPsCount))
 		metricBlockedDNSServersCount.Set(float64(blockedDNSCount))
-		metricAllowedDNSServersCount.Set(float64(allowedDNSCount))
-		metricLeakGuardEnabled.Set(float64(leakGuardFlag))
 		metricIPBlocklistRulesCount.Set(float64(ipBlocklistCount))
 
 		log.Printf("Stats [XDP] Total: %d | DNS queries: %d | Blocked: %d | Allowed: %d",
 			total, dnsPackets, blocked, allowed)
 		log.Printf("Stats [TC]  DNS responses: %d | Blocked: %d | Allowed: %d | Per-IP blocked: %d",
 			dnsResponses, blockedResponses, allowedResponses, ipBlockedResponses)
-		log.Printf("Stats [Maps] Blocked domains: %d | Blocked IPs: %d | Blocked DNS servers: %d | Allowed DNS servers: %d | Leak guard: %v | Per-IP rules: %d",
-			blockedDomainsCount, blockedIPsCount, blockedDNSCount, allowedDNSCount, leakGuardFlag == 1, ipBlocklistCount)
+		log.Printf("Stats [Maps] Blocked domains: %d | Blocked IPs: %d | Blocked DNS servers: %d | Per-IP rules: %d",
+			blockedDomainsCount, blockedIPsCount, blockedDNSCount, ipBlocklistCount)
 		if len(blockedIPsList) > 0 {
 			log.Printf("Stats [Blocked IPs] %s", strings.Join(blockedIPsList, ", "))
 		}
 		if len(blockedDNSList) > 0 {
 			log.Printf("Stats [Blocked DNS Servers] %s", strings.Join(blockedDNSList, ", "))
-		}
-		if len(allowedDNSList) > 0 {
-			log.Printf("Stats [Allowed DNS Servers] %s", strings.Join(allowedDNSList, ", "))
 		}
 		for clientIP, ruleCount := range perIPEntries {
 			log.Printf("Stats [Per-IP Blocklist] Client %s: %d domain rules", clientIP, ruleCount)
