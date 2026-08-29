@@ -88,8 +88,10 @@ docker build -t dnsd:latest .
 | `-blockips` | - | Comma-separated list of IPs to block in DNS responses |
 | `-blocked-dns` | - | Comma-separated list of blocked DNS server IPs |
 | `-ip-blocklist` | - | Per-IP blocklist in format: `IP1:domain1,domain2;IP2:domain3` |
-| `-ip-blocklist-url` | - | URL to fetch per-IP blocklist from (JSON format) |
+| `-ip-blocklist-url` | - | Policy controller URL — base (`http://host:8080`) or full endpoint (`http://host:8080/api/policies`). Env: `DNSD_IP_BLOCKLIST_URL` |
+| `-ip-blocklist-token` | - | Appliance token (`dnsdap_...`) sent as `Authorization: Bearer`. Env: `DNSD_IP_BLOCKLIST_TOKEN` |
 | `-ip-blocklist-interval` | `5m` | Interval to refresh the remote IP blocklist |
+| `-ip-blocklist-timeout` | `30s` | HTTP timeout for a single policy controller request |
 
 ### Standalone Mode
 
@@ -104,10 +106,15 @@ sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 \
 # Block unauthorized DNS servers
 sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 -blocked-dns "8.8.8.8,8.8.4.4"
 
-# Dynamic policy fetching from a remote API
+# Dynamic policy fetching from the policy controller
 sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 \
-  -ip-blocklist-url "http://policy-server:8080/api/policies" \
+  -ip-blocklist-url "http://policy-controller:8080" \
+  -ip-blocklist-token "dnsdap_3c1f9b2a7d0e4685_yT8..." \
   -ip-blocklist-interval 1m
+
+# The token may also come from the environment
+export DNSD_IP_BLOCKLIST_TOKEN="dnsdap_3c1f9b2a7d0e4685_yT8..."
+sudo -E ./dnsd -iface eth0 -ip-blocklist-url "http://policy-controller:8080"
 ```
 
 ### Kubernetes Deployment
@@ -139,8 +146,14 @@ spec:
             - "-iface=eth0"
             - "-upstream=1.1.1.1:53"
             - "-ip-blocklist-url=http://policy-controller:5959/api/policies"
-            - "-ip-blocklist-url=http://policy-controller:5959/api/policies"
             - --upstream-rules="*.privatelink.*.aws.net=168.63.129.16:53;*.internal.corp=10.0.0.1:53;*.google.com=1.1.1.1"
+          env:
+            # Appliance token from POST /api/admin/appliances
+            - name: DNSD_IP_BLOCKLIST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dnsd-appliance-token
+                  key: token
           ports:
             - containerPort: 53
               protocol: UDP
@@ -182,29 +195,58 @@ spec:
       protocol: UDP
 ```
 
-## Remote Policy API Format
+## Remote Policy API
 
-When using `-ip-blocklist-url`, the remote endpoint should return JSON in the following format:
+DNSD is the **appliance plane** client of the policy controller and speaks the
+contract documented in `api/CONTRACT.md`. It only ever calls `GET /api/policies`.
+
+**Request**
+
+```http
+GET /api/policies HTTP/1.1
+Authorization: Bearer dnsdap_3c1f9b2a7d0e4685_yT8...
+If-None-Match: "6f1a9c2b4d3e5081"
+```
+
+The token is an **appliance** token minted by `POST /api/admin/appliances` (or
+`.../rotate`); it is shown exactly once. An admin session token (`dnsdsn_...`)
+belongs to the other credential plane and is rejected with `401` — dnsd refuses to
+start if one is passed. When the controller runs with
+`-require-appliance-auth=false`, the token may be omitted entirely.
+
+**Response** (`200 OK`)
 
 ```json
 {
   "blocklist": [
-    {
-      "ip": "192.168.1.100",
-      "domains": ["facebook.com", "instagram.com"]
-    },
-    {
-      "ip": "192.168.1.101",
-      "domains": ["youtube.com", "tiktok.com"]
-    }
+    { "ip": "192.168.1.100", "domains": ["facebook.com", "instagram.com"] },
+    { "ip": "192.168.1.101", "domains": ["youtube.com", "tiktok.com"] }
   ]
 }
 ```
 
 DNSD will automatically:
-- Fetch the blocklist on startup
-- Periodically refresh based on `-ip-blocklist-interval`
+- Fetch the policies on startup and periodically refresh based on `-ip-blocklist-interval`
+- Send `If-None-Match` (falling back to `If-Modified-Since`) and treat `304 Not Modified`
+  as "nothing to do" — the BPF maps are left untouched
+- Track `X-Policy-Revision` and expose it as the `dnsd_policy_revision` metric
 - Diff changes to add new rules and remove stale ones
+- Normalize domains (lowercase, trailing dot stripped) and skip non-IPv4 entries,
+  since the BPF map is keyed on IPv4
+- Report controller errors using the API's error body
+  (`{"error":..., "message":..., "details":...}`), including the `401`
+  `WWW-Authenticate` challenge and the `X-Request-ID` for correlation
+
+A failed refresh never clears the rules already in the BPF maps; the last known
+good policy set stays in effect until the next successful fetch.
+
+### Policy client metrics
+
+| Metric | Description |
+|--------|-------------|
+| `dnsd_policy_revision` | Revision reported via `X-Policy-Revision` |
+| `dnsd_policy_fetch_total{result="updated\|not_modified\|error"}` | Fetch attempts by result |
+| `dnsd_policy_last_success_timestamp_seconds` | Last successful fetch (`200` or `304`) |
 
 ## How It Works
 

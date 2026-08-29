@@ -11,8 +11,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -93,6 +95,20 @@ var (
 		Name: "dnsd_source_blocked_total",
 		Help: "Total blocked queries per source IP",
 	}, []string{"source_ip"})
+
+	// Policy controller (GET /api/policies) client metrics
+	metricPolicyRevision = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_policy_revision",
+		Help: "Policy revision reported by the controller via X-Policy-Revision",
+	})
+	metricPolicyFetchTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "dnsd_policy_fetch_total",
+		Help: "Policy fetch attempts by result (updated, not_modified, error)",
+	}, []string{"result"})
+	metricPolicyLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_policy_last_success_timestamp_seconds",
+		Help: "Unix timestamp of the last successful policy fetch (200 or 304)",
+	})
 )
 
 func init() {
@@ -110,13 +126,44 @@ func init() {
 		metricBlockedDNSServersCount,
 		metricIPBlocklistRulesCount,
 		metricSourceBlocked,
+		metricPolicyRevision,
+		metricPolicyFetchTotal,
+		metricPolicyLastSuccess,
 	)
 }
 
-// IPBlocklistEntry represents a single entry in the remote blocklist
+// IPBlocklistEntry is one entry of the frozen GET /api/policies payload
+// (pkg/dnsdcontract): an IPv4 client address plus the domains blocked for it.
 type IPBlocklistEntry struct {
 	IP      string   `json:"ip"`
 	Domains []string `json:"domains"`
+}
+
+// APIError is the single error shape used by every policy-controller endpoint.
+type APIError struct {
+	Status    int               `json:"-"`
+	RequestID string            `json:"-"`
+	Code      string            `json:"error"`
+	Message   string            `json:"message"`
+	Details   map[string]string `json:"details,omitempty"`
+}
+
+func (e *APIError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "policy api: %d", e.Status)
+	if e.Code != "" {
+		fmt.Fprintf(&b, " %s", e.Code)
+	}
+	if e.Message != "" {
+		fmt.Fprintf(&b, ": %s", e.Message)
+	}
+	for field, reason := range e.Details {
+		fmt.Fprintf(&b, " (%s: %s)", field, reason)
+	}
+	if e.RequestID != "" {
+		fmt.Fprintf(&b, " [request-id=%s]", e.RequestID)
+	}
+	return b.String()
 }
 
 // UpstreamRule maps a glob domain pattern to a specific upstream DNS server.
@@ -126,9 +173,158 @@ type UpstreamRule struct {
 	Upstream string // e.g. "168.63.129.16:53"
 }
 
-// IPBlocklistResponse represents the JSON response from the remote blocklist endpoint
+// IPBlocklistResponse is the body of GET /api/policies. With no policies the
+// controller sends {"blocklist":[]} — never null.
 type IPBlocklistResponse struct {
 	Blocklist []IPBlocklistEntry `json:"blocklist"`
+}
+
+// policyEndpointPath is the appliance-plane endpoint of the policy controller.
+const policyEndpointPath = "/api/policies"
+
+// maxPolicyBodyBytes caps how much of a response body we are willing to read.
+const maxPolicyBodyBytes = 8 << 20
+
+// policyClient talks to the appliance plane of the policy controller
+// (GET /api/policies). It keeps the validators of the last response so
+// subsequent polls are conditional requests.
+type policyClient struct {
+	url        string
+	token      string
+	httpClient *http.Client
+
+	etag         string
+	lastModified string
+	revision     string
+}
+
+func newPolicyClient(rawURL, token string, timeout time.Duration) *policyClient {
+	return &policyClient{
+		url:        rawURL,
+		token:      token,
+		httpClient: &http.Client{Timeout: timeout},
+	}
+}
+
+// resolvePolicyURL accepts either the controller base URL
+// ("http://policy-controller:8080") or the full endpoint URL
+// ("http://policy-controller:8080/api/policies") and returns the latter.
+func resolvePolicyURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid policy url %q: %w", raw, err)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("invalid policy url %q: missing host", raw)
+	}
+	if path := strings.TrimSuffix(u.Path, "/"); path == "" {
+		u.Path = policyEndpointPath
+	}
+	return u.String(), nil
+}
+
+// fetch performs a conditional GET against /api/policies. A 304 response
+// returns (nil, false, nil): the cached policies are still current.
+func (c *policyClient) fetch() (*IPBlocklistResponse, bool, error) {
+	req, err := http.NewRequest(http.MethodGet, c.url, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("building policy request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	// If-Modified-Since is only considered when If-None-Match is absent
+	// (RFC 9110 13.1.3), so send at most one of them.
+	switch {
+	case c.etag != "":
+		req.Header.Set("If-None-Match", c.etag)
+	case c.lastModified != "":
+		req.Header.Set("If-Modified-Since", c.lastModified)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("fetching policies: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNotModified:
+		// The validators are re-sent on 304 as well; keep tracking them.
+		c.rememberValidators(resp)
+		return nil, false, nil
+	case http.StatusOK:
+	default:
+		return nil, false, parseAPIError(resp)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyBodyBytes))
+	if err != nil {
+		return nil, false, fmt.Errorf("reading policy response: %w", err)
+	}
+
+	var policies IPBlocklistResponse
+	if err := json.Unmarshal(body, &policies); err != nil {
+		return nil, false, fmt.Errorf("parsing policy response: %w", err)
+	}
+
+	c.rememberValidators(resp)
+	return &policies, true, nil
+}
+
+// rememberValidators stores the cache validators and revision of a response so
+// the next poll can be conditional.
+func (c *policyClient) rememberValidators(resp *http.Response) {
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		c.etag = etag
+	}
+	if lastModified := resp.Header.Get("Last-Modified"); lastModified != "" {
+		c.lastModified = lastModified
+	}
+	if revision := resp.Header.Get("X-Policy-Revision"); revision != "" {
+		c.revision = revision
+		if parsed, err := strconv.ParseFloat(revision, 64); err == nil {
+			metricPolicyRevision.Set(parsed)
+		}
+	}
+}
+
+// parseAPIError turns a non-2xx response into an *APIError, falling back to the
+// raw body when it is not the documented JSON error shape.
+func parseAPIError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	apiErr := &APIError{
+		Status:    resp.StatusCode,
+		RequestID: resp.Header.Get("X-Request-ID"),
+	}
+	if err := json.Unmarshal(body, apiErr); err != nil || apiErr.Message == "" {
+		apiErr.Message = strings.TrimSpace(string(body))
+		if apiErr.Message == "" {
+			apiErr.Message = http.StatusText(resp.StatusCode)
+		}
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		if challenge := resp.Header.Get("WWW-Authenticate"); challenge != "" {
+			apiErr.Message += fmt.Sprintf(" (WWW-Authenticate: %s)", challenge)
+		}
+	}
+	return apiErr
+}
+
+// normalizeDomain mirrors the controller-side normalization so a domain hashes
+// to the same BPF key regardless of the casing or trailing dot we were sent.
+func normalizeDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 }
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf bpf/xdp_tc.c -- -I/usr/include/bpf -Wall
@@ -142,7 +338,7 @@ type DNSProxy struct {
 	objs             *bpfObjects
 	blockedDomains   map[string]bool
 	dnsClient        *dns.Client
-	ipBlocklistURL   string
+	policyAPI        *policyClient
 	ipBlocklistMu    sync.RWMutex
 	currentBlocklist []IPBlocklistEntry
 	ipam             string
@@ -181,8 +377,10 @@ func main() {
 	blockips := flag.String("blockips", "", "Comma-separated list of IPs to block in DNS responses")
 	blockedDNS := flag.String("blocked-dns", "", "Comma-separated list of blocked DNS server IPs")
 	ipBlocklist := flag.String("ip-blocklist", "", "Per-IP blocklist. Format: 'IP1:domain1,domain2;IP2:domain3' (e.g., '5.23.44.53:www.google.com,facebook.com;192.168.1.10:youtube.com')")
-	ipBlocklistURL := flag.String("ip-blocklist-url", "", "URL to fetch per-IP blocklist from (JSON format)")
+	ipBlocklistURL := flag.String("ip-blocklist-url", os.Getenv("DNSD_IP_BLOCKLIST_URL"), "Policy controller URL. Either the base URL (http://host:8080) or the full endpoint (http://host:8080/api/policies). Env: DNSD_IP_BLOCKLIST_URL")
+	ipBlocklistToken := flag.String("ip-blocklist-token", os.Getenv("DNSD_IP_BLOCKLIST_TOKEN"), "Appliance token (dnsdap_...) sent as 'Authorization: Bearer'. Env: DNSD_IP_BLOCKLIST_TOKEN")
 	ipBlocklistInterval := flag.Duration("ip-blocklist-interval", 5*time.Minute, "Interval to refresh the remote IP blocklist")
+	ipBlocklistTimeout := flag.Duration("ip-blocklist-timeout", 30*time.Second, "HTTP timeout for a policy controller request")
 	linkMode := flag.String("link-mode", "generic", "The type of links while attaching XDP programs")
 	ipam := flag.String("ipam", "onpremise", "The identifer which gives details for CNI ipam usage.")
 
@@ -196,15 +394,32 @@ func main() {
 	linkTypeMap["driver"] = link.XDPDriverMode
 	linkTypeMap["offload"] = link.XDPOffloadMode
 
+	policyURL, err := resolvePolicyURL(*ipBlocklistURL)
+	if err != nil {
+		log.Fatalf("Invalid -ip-blocklist-url: %v", err)
+	}
+
 	proxy := &DNSProxy{
 		iface:            *iface,
 		upstreamDNS:      *upstream,
 		blockedDomains:   make(map[string]bool),
 		dnsClient:        &dns.Client{Net: "udp", Timeout: 5 * time.Second},
-		ipBlocklistURL:   *ipBlocklistURL,
 		currentBlocklist: []IPBlocklistEntry{},
 		linkTypeMap:      linkTypeMap,
 		ipam:             *ipam,
+	}
+
+	if policyURL != "" {
+		token := strings.TrimSpace(*ipBlocklistToken)
+		switch {
+		case token == "":
+			log.Printf("Warning: no -ip-blocklist-token given; the controller will answer 401 unless it runs with -require-appliance-auth=false")
+		case strings.HasPrefix(token, "dnsdsn_"):
+			log.Fatalf("-ip-blocklist-token looks like an admin session token (dnsdsn_); dnsd needs an appliance token (dnsdap_) from POST /api/admin/appliances")
+		case !strings.HasPrefix(token, "dnsdap_"):
+			log.Printf("Warning: -ip-blocklist-token does not have the expected dnsdap_ prefix")
+		}
+		proxy.policyAPI = newPolicyClient(policyURL, token, *ipBlocklistTimeout)
 	}
 
 	if *blocklist != "" {
@@ -335,11 +550,12 @@ func main() {
 		}
 	}
 
-	// Start remote IP blocklist fetcher if URL is provided
-	if *ipBlocklistURL != "" {
+	// Start the policy controller poller if a URL is configured
+	if proxy.policyAPI != nil {
+		log.Printf("Policy controller: %s", proxy.policyAPI.url)
 		// Fetch immediately on startup
 		if err := proxy.fetchAndUpdateIPBlocklist(); err != nil {
-			log.Printf("Warning: initial remote IP blocklist fetch failed: %v", err)
+			log.Printf("Warning: initial policy fetch failed: %v", err)
 		}
 		// Start periodic refresh
 		go proxy.startIPBlocklistRefresher(*ipBlocklistInterval)
@@ -534,6 +750,10 @@ func (p *DNSProxy) UnblockDomainForIP(clientIP, domain string) error {
 	}
 
 	if err := p.objs.IpBlocklist.Delete(&key); err != nil {
+		// The rule is already gone; nothing left to do.
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
 		return fmt.Errorf("unblocking domain %s for IP %s: %w", domain, clientIP, err)
 	}
 
@@ -921,89 +1141,132 @@ func (p *DNSProxy) cleanup() {
 	log.Println("Cleanup completed")
 }
 
-// fetchAndUpdateIPBlocklist fetches the IP blocklist from the remote URL and updates the BPF maps
+// fetchAndUpdateIPBlocklist polls GET /api/policies on the policy controller and
+// reconciles the per-IP BPF map with the response. A 304 leaves the maps alone.
 func (p *DNSProxy) fetchAndUpdateIPBlocklist() error {
-	if p.ipBlocklistURL == "" {
+	if p.policyAPI == nil {
 		return nil
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(p.ipBlocklistURL)
+	policies, changed, err := p.policyAPI.fetch()
 	if err != nil {
-		return fmt.Errorf("fetching IP blocklist: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		metricPolicyFetchTotal.WithLabelValues("error").Inc()
+		return err
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading response body: %w", err)
+	metricPolicyLastSuccess.SetToCurrentTime()
+
+	if !changed {
+		metricPolicyFetchTotal.WithLabelValues("not_modified").Inc()
+		log.Printf("Policies unchanged (revision %s)", p.policyAPI.revisionLabel())
+		return nil
 	}
 
-	var blocklist IPBlocklistResponse
-	if err := json.Unmarshal(body, &blocklist); err != nil {
-		return fmt.Errorf("parsing JSON: %w", err)
-	}
+	metricPolicyFetchTotal.WithLabelValues("updated").Inc()
+	p.applyPolicies(policies.Blocklist)
+	return nil
+}
 
+// applyPolicies diffs the freshly fetched policies against the ones currently in
+// the BPF map and applies only the difference.
+func (p *DNSProxy) applyPolicies(entries []IPBlocklistEntry) {
 	p.ipBlocklistMu.Lock()
 	defer p.ipBlocklistMu.Unlock()
 
-	// Build sets of current and new entries for diffing
-	currentSet := make(map[string]map[string]bool)
-	for _, entry := range p.currentBlocklist {
-		if currentSet[entry.IP] == nil {
-			currentSet[entry.IP] = make(map[string]bool)
-		}
-		for _, domain := range entry.Domains {
-			currentSet[entry.IP][strings.ToLower(domain)] = true
-		}
-	}
+	currentSet := indexPolicies(p.currentBlocklist)
+	newSet := indexPolicies(entries)
 
-	newSet := make(map[string]map[string]bool)
-	for _, entry := range blocklist.Blocklist {
-		if newSet[entry.IP] == nil {
-			newSet[entry.IP] = make(map[string]bool)
+	// inMap is what the BPF map holds once this reconciliation is done. It is
+	// what the next refresh diffs against, so a rule we failed to remove stays
+	// listed (to be retried) and a rule we failed to add does not.
+	inMap := make(map[string]map[string]bool, len(newSet))
+	keep := func(ip, domain string) {
+		if inMap[ip] == nil {
+			inMap[ip] = make(map[string]bool)
 		}
-		for _, domain := range entry.Domains {
-			newSet[entry.IP][strings.ToLower(domain)] = true
-		}
+		inMap[ip][domain] = true
 	}
 
 	// Remove entries that are no longer in the new blocklist
+	removedCount := 0
 	for ip, domains := range currentSet {
 		for domain := range domains {
-			if newSet[ip] == nil || !newSet[ip][domain] {
-				if err := p.UnblockDomainForIP(ip, domain); err != nil {
-					log.Printf("Warning: failed to unblock domain %s for IP %s: %v", domain, ip, err)
-				}
+			if newSet[ip][domain] {
+				continue
 			}
+			if err := p.UnblockDomainForIP(ip, domain); err != nil {
+				log.Printf("Warning: failed to unblock domain %s for IP %s: %v", domain, ip, err)
+				keep(ip, domain)
+				continue
+			}
+			removedCount++
 		}
 	}
 
-	// Add new entries
+	// Add entries that are not in the map yet
 	addedCount := 0
-	for _, entry := range blocklist.Blocklist {
-		for _, domain := range entry.Domains {
-			domain = strings.ToLower(domain)
-			// Only add if not already present
-			if currentSet[entry.IP] == nil || !currentSet[entry.IP][domain] {
-				if err := p.BlockDomainForIP(entry.IP, domain); err != nil {
-					log.Printf("Warning: failed to block domain %s for IP %s: %v", domain, entry.IP, err)
-				} else {
-					addedCount++
-				}
+	for ip, domains := range newSet {
+		for domain := range domains {
+			if currentSet[ip][domain] {
+				keep(ip, domain)
+				continue
 			}
+			if err := p.BlockDomainForIP(ip, domain); err != nil {
+				log.Printf("Warning: failed to block domain %s for IP %s: %v", domain, ip, err)
+				continue
+			}
+			keep(ip, domain)
+			addedCount++
 		}
 	}
 
-	// Update current blocklist
-	p.currentBlocklist = blocklist.Blocklist
+	p.currentBlocklist = flattenPolicies(inMap)
 
-	log.Printf("Remote IP blocklist updated: %d entries total, %d new entries added", len(blocklist.Blocklist), addedCount)
-	return nil
+	log.Printf("Policies applied (revision %s): %d client(s), %d rule(s) added, %d removed",
+		p.policyAPI.revisionLabel(), len(entries), addedCount, removedCount)
+}
+
+// indexPolicies groups normalized domains per client IP, dropping entries whose
+// IP is not a usable IPv4 address (the BPF map is keyed on IPv4).
+func indexPolicies(entries []IPBlocklistEntry) map[string]map[string]bool {
+	index := make(map[string]map[string]bool, len(entries))
+	for _, entry := range entries {
+		ip := net.ParseIP(strings.TrimSpace(entry.IP))
+		if ip == nil || ip.To4() == nil {
+			log.Printf("Warning: skipping policy for %q: not an IPv4 address", entry.IP)
+			continue
+		}
+		key := ip.To4().String()
+		if index[key] == nil {
+			index[key] = make(map[string]bool, len(entry.Domains))
+		}
+		for _, domain := range entry.Domains {
+			if domain = normalizeDomain(domain); domain != "" {
+				index[key][domain] = true
+			}
+		}
+	}
+	return index
+}
+
+// flattenPolicies turns the per-IP index back into the entry list kept on the proxy.
+func flattenPolicies(index map[string]map[string]bool) []IPBlocklistEntry {
+	entries := make([]IPBlocklistEntry, 0, len(index))
+	for ip, domains := range index {
+		list := make([]string, 0, len(domains))
+		for domain := range domains {
+			list = append(list, domain)
+		}
+		entries = append(entries, IPBlocklistEntry{IP: ip, Domains: list})
+	}
+	return entries
+}
+
+func (c *policyClient) revisionLabel() string {
+	if c == nil || c.revision == "" {
+		return "unknown"
+	}
+	return c.revision
 }
 
 // startIPBlocklistRefresher periodically fetches and updates the IP blocklist
@@ -1011,11 +1274,11 @@ func (p *DNSProxy) startIPBlocklistRefresher(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("IP blocklist refresher started (interval: %v)", interval)
+	log.Printf("Policy refresher started (interval: %v)", interval)
 
 	for range ticker.C {
 		if err := p.fetchAndUpdateIPBlocklist(); err != nil {
-			log.Printf("Error refreshing IP blocklist: %v", err)
+			log.Printf("Error refreshing policies: %v", err)
 		}
 	}
 }
