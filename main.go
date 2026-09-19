@@ -456,8 +456,8 @@ func main() {
 
 		go proxy.watchENIInterfaces(linkMode)
 	default:
-		if err := proxy.loadBPF("eth0", linkMode); err != nil {
-			log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, "eth0")
+		if err := proxy.loadBPF(*iface, linkMode); err != nil {
+			log.Fatalf("Failed to load eBPF programs: %v iface name: %s", err, *iface)
 		}
 	}
 
