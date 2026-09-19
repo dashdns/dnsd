@@ -9,6 +9,7 @@ DNSD is a high-performance DNS proxy that leverages eBPF (Extended Berkeley Pack
 - **Per-IP Domain Blocking**: Apply different blocking rules per client IP address
 - **Dynamic Policy Management**: Fetch and auto-refresh blocking policies from a remote API endpoint
 - **Conditional Resolver**: Define conditional reserver address for each type of address regex expressions.
+- **Answer Cache**: TTL-aware, LRU-bounded userspace cache of upstream answers, including RFC 2308 negative caching
 - **DNS Server Blocking**: Prevent clients from using unauthorized DNS servers
 - **IP Response Blocking**: Block specific IPs from appearing in DNS responses
 - **Real-time Statistics**: Monitor packet counts, blocked queries, and allowed queries
@@ -92,6 +93,11 @@ docker build -t dnsd:latest .
 | `-ip-blocklist-token` | - | Appliance token (`dnsdap_...`) sent as `Authorization: Bearer`. Env: `DNSD_IP_BLOCKLIST_TOKEN` |
 | `-ip-blocklist-interval` | `5m` | Interval to refresh the remote IP blocklist |
 | `-ip-blocklist-timeout` | `30s` | HTTP timeout for a single policy controller request |
+| `-cache` | `true` | Cache upstream DNS answers in userspace |
+| `-cache-size` | `10000` | Maximum number of answers kept in the cache (LRU eviction) |
+| `-cache-min-ttl` | `0` | Lower bound for a cached answer's lifetime; `0` respects the upstream TTL |
+| `-cache-max-ttl` | `1h` | Upper bound for a cached positive answer's lifetime |
+| `-cache-negative-ttl` | `1m` | Upper bound for a cached NXDOMAIN/NODATA answer's lifetime |
 
 ### Standalone Mode
 
@@ -105,6 +111,13 @@ sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 \
 
 # Block unauthorized DNS servers
 sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 -blocked-dns "8.8.8.8,8.8.4.4"
+
+# Cache tuning - keep more answers, never trust a TTL shorter than 10s or longer than 10m
+sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 \
+  -cache-size 50000 -cache-min-ttl 10s -cache-max-ttl 10m
+
+# Turn the cache off entirely
+sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 -cache=false
 
 # Dynamic policy fetching from the policy controller
 sudo ./dnsd -iface eth0 -upstream 1.1.1.1:53 \
@@ -248,13 +261,58 @@ good policy set stays in effect until the next successful fetch.
 | `dnsd_policy_fetch_total{result="updated\|not_modified\|error"}` | Fetch attempts by result |
 | `dnsd_policy_last_success_timestamp_seconds` | Last successful fetch (`200` or `304`) |
 
+## DNS Cache
+
+Answers coming back from the upstream resolver are cached in userspace, so a
+repeated question is served locally instead of crossing the network again.
+
+**Where it sits.** The cache is consulted *after* every blocklist check
+(per-IP, then global). A cached answer can therefore never be used to bypass a
+policy: a client that is not allowed to resolve a name gets `NXDOMAIN` before
+the cache is ever looked at, and a policy change takes effect on the next query
+without any cache invalidation.
+
+**What is cached.** Single-question queries of a normal type. `ANY`, `AXFR` and
+`IXFR` are skipped because their answers are partial by nature, and so are
+truncated responses, signed (TSIG) responses, anything other than `NOERROR` /
+`NXDOMAIN`, and records with a TTL of `0`.
+
+**How long.** A positive answer lives for the smallest TTL in the message,
+clamped to `[-cache-min-ttl, -cache-max-ttl]`. A negative answer (`NXDOMAIN`
+or `NOERROR` with an empty answer section) follows RFC 2308: the smaller of the
+authority SOA's TTL and its `MINIMUM` field, capped by `-cache-negative-ttl`.
+When there is no SOA to derive a TTL from, `-cache-negative-ttl` is used as is.
+
+**What clients see.** Each hit is a private copy of the stored answer: the TTLs
+are counted down by the time the entry spent in the cache, the transaction ID
+and question come from the requesting client, and the `OPT` record is rebuilt
+from the EDNS0 options that client advertised, then the message is truncated to
+the client's own buffer size. The DNSSEC `DO` bit is part of the cache key, so a
+DNSSEC-aware client never gets an answer that was collected for a plain one.
+
+**Bounds.** The cache holds at most `-cache-size` answers and drops the least
+recently used one when full. Entries whose TTL has run out are purged on the
+same 10-second tick that reports the statistics.
+
+### Cache metrics
+
+| Metric | Description |
+|--------|-------------|
+| `dnsd_cache_entries` | Answers currently held in the cache |
+| `dnsd_cache_capacity` | Configured `-cache-size` |
+| `dnsd_cache_hits_total` | Queries answered from the cache |
+| `dnsd_cache_misses_total` | Queries that had to be forwarded upstream |
+| `dnsd_cache_inserts_total` | Upstream answers stored |
+| `dnsd_cache_evictions_total` | Answers dropped because the cache was full |
+| `dnsd_cache_expired_total` | Answers dropped because their TTL ran out |
+
 ## How It Works
 
 1. **XDP Program (Ingress)**: Attached to the network interface, inspects incoming DNS queries at the earliest possible point in the network stack. Blocked queries are dropped before reaching userspace.
 
 2. **TC Program (Egress)**: Monitors outgoing traffic to detect and block DNS queries to unauthorized DNS servers.
 
-3. **Userspace DNS Server**: Handles DNS queries that pass through eBPF filters, performs additional policy checks, and forwards allowed queries to the upstream DNS server.
+3. **Userspace DNS Server**: Handles DNS queries that pass through eBPF filters, performs additional policy checks, answers from the cache when a fresh copy is held, and forwards the remaining queries to the upstream DNS server.
 
 4. **eBPF Maps**: Shared data structures between kernel and userspace for storing:
    - `blocked_domains`: Global domain blocklist (domain hash -> blocked)
@@ -305,6 +363,9 @@ dnsd:
 - [ ] DNS over HTTPS (DoH) upstream support
 - [ ] Web-based management UI
 - [x] Prometheus metrics endpoint
+- [x] Userspace answer cache with TTL and negative caching
+- [ ] Serve-stale: answer from an expired entry when the upstream is unreachable
+- [ ] Coalesce identical in-flight queries into a single upstream request
 
 ## License
 

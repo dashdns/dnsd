@@ -109,6 +109,36 @@ var (
 		Name: "dnsd_policy_last_success_timestamp_seconds",
 		Help: "Unix timestamp of the last successful policy fetch (200 or 304)",
 	})
+
+	// Userspace answer cache
+	metricCacheEntries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_entries",
+		Help: "Answers currently held in the DNS cache",
+	})
+	metricCacheCapacity = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_capacity",
+		Help: "Maximum number of answers the DNS cache holds",
+	})
+	metricCacheHits = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_hits_total",
+		Help: "DNS queries answered from the cache",
+	})
+	metricCacheMisses = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_misses_total",
+		Help: "DNS queries that had to be forwarded upstream",
+	})
+	metricCacheInserts = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_inserts_total",
+		Help: "Upstream answers stored in the cache",
+	})
+	metricCacheEvictions = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_evictions_total",
+		Help: "Answers dropped from the cache because it was full",
+	})
+	metricCacheExpired = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dnsd_cache_expired_total",
+		Help: "Answers dropped from the cache because their TTL ran out",
+	})
 )
 
 func init() {
@@ -129,6 +159,13 @@ func init() {
 		metricPolicyRevision,
 		metricPolicyFetchTotal,
 		metricPolicyLastSuccess,
+		metricCacheEntries,
+		metricCacheCapacity,
+		metricCacheHits,
+		metricCacheMisses,
+		metricCacheInserts,
+		metricCacheEvictions,
+		metricCacheExpired,
 	)
 }
 
@@ -344,6 +381,7 @@ type DNSProxy struct {
 	ipam             string
 	linkTypeMap      map[string]link.XDPAttachFlags
 	ringReader       *ringbuf.Reader
+	cache            *DNSCache // nil when caching is disabled
 }
 
 // IPDomainKey matches the BPF ip_domain_key struct
@@ -383,6 +421,11 @@ func main() {
 	ipBlocklistTimeout := flag.Duration("ip-blocklist-timeout", 30*time.Second, "HTTP timeout for a policy controller request")
 	linkMode := flag.String("link-mode", "generic", "The type of links while attaching XDP programs")
 	ipam := flag.String("ipam", "onpremise", "The identifer which gives details for CNI ipam usage.")
+	cacheEnabled := flag.Bool("cache", true, "Cache upstream DNS answers in userspace")
+	cacheSize := flag.Int("cache-size", 10000, "Maximum number of answers kept in the DNS cache (least recently used ones are evicted)")
+	cacheMinTTL := flag.Duration("cache-min-ttl", 0, "Lower bound for a cached answer's lifetime; 0 respects the upstream TTL")
+	cacheMaxTTL := flag.Duration("cache-max-ttl", time.Hour, "Upper bound for a cached positive answer's lifetime")
+	cacheNegativeTTL := flag.Duration("cache-negative-ttl", time.Minute, "Upper bound for a cached NXDOMAIN/NODATA answer's lifetime (RFC 2308)")
 
 	flag.Parse()
 
@@ -407,6 +450,18 @@ func main() {
 		currentBlocklist: []IPBlocklistEntry{},
 		linkTypeMap:      linkTypeMap,
 		ipam:             *ipam,
+	}
+
+	if *cacheEnabled {
+		proxy.cache = NewDNSCache(CacheConfig{
+			MaxEntries:  *cacheSize,
+			MinTTL:      *cacheMinTTL,
+			MaxTTL:      *cacheMaxTTL,
+			NegativeTTL: *cacheNegativeTTL,
+		})
+		if proxy.cache == nil {
+			log.Printf("Warning: -cache-size %d disables the DNS cache", *cacheSize)
+		}
 	}
 
 	if policyURL != "" {
@@ -564,6 +619,12 @@ func main() {
 	log.Printf("DNS Proxy started on interface %s", *iface)
 	log.Printf("Upstream DNS: %s", *upstream)
 	log.Printf("Blocking %d domains", len(proxy.blockedDomains))
+	if proxy.cache != nil {
+		log.Printf("DNS cache enabled (size: %d, min TTL: %v, max TTL: %v, negative TTL: %v)",
+			*cacheSize, *cacheMinTTL, *cacheMaxTTL, *cacheNegativeTTL)
+	} else {
+		log.Printf("DNS cache disabled")
+	}
 
 	go func() {
 		mux := http.NewServeMux()
@@ -916,6 +977,23 @@ func (p *DNSProxy) reportStats() {
 			log.Printf("Stats [Per-IP Blocklist] Client %s: %d domain rules", clientIP, ruleCount)
 		}
 
+		// DNS cache: drop whatever expired since the last tick, then publish.
+		if p.cache != nil {
+			p.cache.PurgeExpired()
+			cacheStats := p.cache.Stats()
+			metricCacheEntries.Set(float64(cacheStats.Entries))
+			metricCacheCapacity.Set(float64(cacheStats.Capacity))
+			metricCacheHits.Set(float64(cacheStats.Hits))
+			metricCacheMisses.Set(float64(cacheStats.Misses))
+			metricCacheInserts.Set(float64(cacheStats.Inserts))
+			metricCacheEvictions.Set(float64(cacheStats.Evictions))
+			metricCacheExpired.Set(float64(cacheStats.Expired))
+
+			log.Printf("Stats [Cache] Entries: %d/%d | Hits: %d | Misses: %d (%.1f%% hit rate) | Inserts: %d | Evicted: %d | Expired: %d",
+				cacheStats.Entries, cacheStats.Capacity, cacheStats.Hits, cacheStats.Misses,
+				cacheHitRate(cacheStats), cacheStats.Inserts, cacheStats.Evictions, cacheStats.Expired)
+		}
+
 		// Per-source-IP blocked query counts
 		metricSourceBlocked.Reset()
 		var srcIP uint32
@@ -1012,6 +1090,15 @@ func (p *DNSProxy) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		}
 	}
 
+	// Only answer from the cache once every blocklist check above has passed,
+	// so a cached answer can never be used to bypass a policy.
+	if cached, ok := p.cache.Get(r); ok {
+		if err := w.WriteMsg(cached); err != nil {
+			log.Printf("Error writing cached DNS response: %v", err)
+		}
+		return
+	}
+
 	qname := ""
 	if len(r.Question) > 0 {
 		qname = r.Question[0].Name
@@ -1025,6 +1112,8 @@ func (p *DNSProxy) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		w.WriteMsg(m)
 		return
 	}
+
+	p.cache.Put(r, resp)
 
 	w.WriteMsg(resp)
 }
