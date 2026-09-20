@@ -28,6 +28,12 @@ DNSD_IPAM="@DNSD_IPAM@"
 # XDP attach mode: generic (SKB, works everywhere) | driver (native, ENA) | offload
 DNSD_LINK_MODE="@DNSD_LINK_MODE@"
 
+# Interface MTU. Leave empty for automatic handling: with DNSD_LINK_MODE=driver
+# on an ENA NIC the MTU is capped at 3498, because the driver refuses native XDP
+# above that (EC2 defaults to jumbo frames at 9001). Jumbo frames buy a DNS
+# resolver nothing. Set 1500 explicitly if you run into path-MTU trouble.
+DNSD_MTU=""
+
 # Default upstream resolver. 169.254.169.253 is the AWS VPC resolver (the
 # .2 address of the VPC CIDR also works).
 DNSD_UPSTREAM="@DNSD_UPSTREAM@"

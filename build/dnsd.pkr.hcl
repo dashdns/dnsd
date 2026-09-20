@@ -1,6 +1,6 @@
 // Packer template for the dnsd appliance AMI.
 //
-//   Base      : Debian 13 (trixie) official cloud AMI
+//   Base      : Ubuntu 24.04 LTS (noble) official cloud AMI
 //   Artifact  : /opt/dashdns/dnsd, compiled in-guest from this working tree
 //   Tuning    : /etc/sysctl.d/90-dnsd-network.conf + ethtool ring/queue sizing
 //   Slimming  : redundant packages purged, unused kernel modules blacklisted
@@ -36,7 +36,7 @@ locals {
     Name          = "${var.ami_name_prefix}-${var.dnsd_version}"
     Application   = "dnsd"
     Version       = var.dnsd_version
-    BaseOS        = "debian-13"
+    BaseOS        = "ubuntu-24.04"
     BuiltBy       = "packer"
     BuildDate     = local.timestamp
     SourceAMIName = "{{ .SourceAMIName }}"
@@ -52,7 +52,7 @@ source "amazon-ebs" "amd64" {
   instance_type = var.instance_type_amd64
 
   ami_name        = "${var.ami_name_prefix}-amd64-${var.dnsd_version}-${local.timestamp}"
-  ami_description = "dnsd eBPF/XDP DNS filtering appliance (Debian 13, amd64, ${var.dnsd_version})"
+  ami_description = "dnsd eBPF/XDP DNS filtering appliance (Ubuntu 24.04, amd64, ${var.dnsd_version})"
   ami_regions     = var.ami_regions
   ami_users       = var.ami_users
   ena_support     = true
@@ -65,12 +65,12 @@ source "amazon-ebs" "amd64" {
       virtualization-type = "hvm"
       architecture        = "x86_64"
     }
-    owners      = [var.debian_owner]
+    owners      = [var.base_ami_owner]
     most_recent = true
   }
 
   launch_block_device_mappings {
-    device_name           = "/dev/xvda"
+    device_name           = var.root_device_name
     volume_size           = var.volume_size
     volume_type           = var.volume_type
     delete_on_termination = true
@@ -104,7 +104,7 @@ source "amazon-ebs" "arm64" {
   instance_type = var.instance_type_arm64
 
   ami_name        = "${var.ami_name_prefix}-arm64-${var.dnsd_version}-${local.timestamp}"
-  ami_description = "dnsd eBPF/XDP DNS filtering appliance (Debian 13, arm64, ${var.dnsd_version})"
+  ami_description = "dnsd eBPF/XDP DNS filtering appliance (Ubuntu 24.04, arm64, ${var.dnsd_version})"
   ami_regions     = var.ami_regions
   ami_users       = var.ami_users
   ena_support     = true
@@ -116,12 +116,12 @@ source "amazon-ebs" "arm64" {
       virtualization-type = "hvm"
       architecture        = "arm64"
     }
-    owners      = [var.debian_owner]
+    owners      = [var.base_ami_owner]
     most_recent = true
   }
 
   launch_block_device_mappings {
-    device_name           = "/dev/xvda"
+    device_name           = var.root_device_name
     volume_size           = var.volume_size
     volume_type           = var.volume_type
     delete_on_termination = true
@@ -225,7 +225,7 @@ build {
 
     custom_data = {
       dnsd_version = var.dnsd_version
-      base_os      = "debian-13"
+      base_os      = "ubuntu-24.04"
       build_time   = local.timestamp
     }
   }

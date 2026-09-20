@@ -158,6 +158,29 @@ The practical consequence: on a 4-vCPU instance you get 2 XDP queues. If you
 need more parallelism in the data path, pick an instance type with more ENA
 channels rather than raising the count.
 
+#### ENA also caps the MTU at 3498 for native XDP
+
+The second, independent constraint. ENA has to fit a frame plus headroom and
+`skb_shared_info` into a single page, so `ENA_XDP_MAX_MTU` is 3498:
+
+```
+ena 0000:00:05.0 ens5: Failed to set xdp program, the current MTU (9001) is
+larger than the maximum allowed MTU (3498) while xdp is on
+```
+
+EC2 hands out jumbo frames (9001) inside a VPC by default, so `-link-mode=driver`
+is impossible until the MTU comes down. `dnsd-tune-nic` lowers it to 3498 before
+dnsd attaches, and from then on the driver itself refuses to raise it past the
+limit — so this does not need to survive DHCP renewals on its own.
+
+Jumbo frames buy a DNS resolver nothing: queries and answers sit far below 1500
+bytes. Override with `DNSD_MTU` in `/etc/default/dnsd` — set `1500` if you run
+into path-MTU trouble, since 3498 relies on PMTU discovery working for anything
+that sends you larger datagrams.
+
+Both caps are skipped in generic mode, where XDP runs in the stack and the
+driver constrains nothing.
+
 Both `ethtool -G` and `ethtool -L` bounce the link (`ena_close`/`ena_open`), so
 the script skips any call that would be a no-op, and the unit is ordered after
 `network-online.target` — resizing while DHCP is still settling can leave the
@@ -396,6 +419,14 @@ ethtool -g ens5
 XDP. Set `DNSD_LINK_MODE="generic"` in `/etc/default/dnsd` and restart. Native
 mode needs ENA (or ixgbe/i40e/ice/mlx5/virtio-net); `50-nic-tuning.sh` warns at
 build time when it cannot confirm it.
+
+**`Failed to set xdp program ... channel count should be at most half`** or
+**`... MTU (9001) is larger than the maximum allowed MTU (3498)`** — ENA's two
+native-XDP constraints. `dnsd-tune-nic` handles both, so this means it did not
+run before dnsd: check `journalctl -u 'dnsd-tune-nic@*'` and confirm the udev
+rule fired. Verify by hand with `ethtool -l ens5` (combined must be ≤ max/2) and
+`ip link show ens5` (mtu must be ≤ 3498). The quick escape hatch is
+`DNSD_LINK_MODE="generic"`, which lifts both constraints at a throughput cost.
 
 **`adding clsact qdisc: no such file or directory`** — `sch_ingress` did not
 load (not `sch_clsact`; that module does not exist). Check

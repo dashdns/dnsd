@@ -37,28 +37,38 @@ variable "dnsd_version" {
 // Base image
 // ---------------------------------------------------------------------------
 
-variable "debian_owner" {
+variable "base_ami_owner" {
   type        = string
-  default     = "136693071363"
-  description = "AWS account that owns the official Debian AMIs."
+  default     = "099720109477"
+  description = "AWS account that owns the base AMIs. 099720109477 is Canonical."
 }
 
 variable "source_ami_filter_amd64" {
   type        = string
-  default     = "debian-13-amd64-*"
-  description = "Name filter used to find the newest Debian 13 amd64 base AMI."
+  default     = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+  description = "Name filter used to find the newest Ubuntu 24.04 amd64 base AMI."
 }
 
 variable "source_ami_filter_arm64" {
   type        = string
-  default     = "debian-13-arm64-*"
-  description = "Name filter used to find the newest Debian 13 arm64 base AMI."
+  default     = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"
+  description = "Name filter used to find the newest Ubuntu 24.04 arm64 base AMI."
 }
 
 variable "ssh_username" {
   type        = string
-  default     = "admin"
-  description = "Login user on the official Debian AMIs."
+  default     = "ubuntu"
+  description = "Login user on the official Ubuntu AMIs (Debian AMIs use 'admin')."
+}
+
+variable "root_device_name" {
+  type        = string
+  default     = "/dev/sda1"
+  description = <<-EOT
+    Root block device of the base AMI. Ubuntu uses /dev/sda1; Debian uses
+    /dev/xvda. Getting this wrong makes Packer attach a second volume instead
+    of resizing the root one.
+  EOT
 }
 
 // ---------------------------------------------------------------------------
@@ -131,8 +141,8 @@ variable "go_version" {
 
 variable "llvm_version" {
   type        = string
-  default     = "19"
-  description = "clang/LLVM major version used to compile bpf/xdp_tc.c. Debian 13 ships 19."
+  default     = "18"
+  description = "clang/LLVM major version used to compile bpf/xdp_tc.c. Ubuntu 24.04 ships 18; Debian 13 ships 19."
 }
 
 // ---------------------------------------------------------------------------

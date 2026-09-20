@@ -20,12 +20,19 @@ log() { printf 'dnsd-tune-nic[%s]: %s\n' "${IFACE:--}" "$*"; }
 # The image build uses this: every ethtool write below bounces the link, and
 # the builder's SSH session runs over that same interface.
 DRY_RUN="${DNSD_TUNE_DRY_RUN:-0}"
-apply() {
+run() {
     if [[ "${DRY_RUN}" == "1" ]]; then
-        log "DRY RUN: would run: ethtool $*"
+        log "DRY RUN: would run: $*"
         return 0
     fi
-    ethtool "$@" 2>/dev/null
+    "$@" 2>/dev/null
+}
+apply() { run ethtool "$@"; }
+
+# Read a variable out of /etc/default/dnsd. Grep rather than source: that file
+# holds the policy-controller bearer token and this runs from udev.
+dnsd_default() {
+    sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" /etc/default/dnsd 2>/dev/null | tail -1
 }
 
 if [[ -z "${IFACE}" ]]; then
@@ -52,6 +59,48 @@ fi
 
 driver=$(ethtool -i "${IFACE}" 2>/dev/null | awk '/^driver:/ {print $2}')
 log "driver=${driver:-unknown}"
+
+# ---------------------------------------------------------------------------
+# MTU
+#
+# ENA refuses to attach a native XDP program when the MTU exceeds
+# ENA_XDP_MAX_MTU (3498) — the driver has to fit a frame plus headroom and
+# skb_shared_info into a single page:
+#
+#   ena ... Failed to set xdp program, the current MTU (9001) is larger than
+#   the maximum allowed MTU (3498) while xdp is on
+#
+# EC2 hands out jumbo frames (9001) inside a VPC by default, so driver mode is
+# impossible until the MTU comes down. Lower it here, before dnsd attaches.
+#
+# This does not need to survive DHCP renewals on its own: once XDP is attached
+# the driver itself rejects any attempt to raise the MTU past the limit.
+#
+# Jumbo frames buy a DNS resolver nothing — queries and answers are far below
+# 1500 bytes. Set DNSD_MTU in /etc/default/dnsd to override (1500 is the
+# conservative choice if you hit path-MTU trouble).
+# ---------------------------------------------------------------------------
+ENA_XDP_MAX_MTU=3498
+
+want_mtu=$(dnsd_default DNSD_MTU)
+cur_mtu=$(cat "/sys/class/net/${IFACE}/mtu" 2>/dev/null || echo 0)
+mode=$(dnsd_default DNSD_LINK_MODE); mode="${mode:-generic}"
+
+if [[ -z "${want_mtu}" ]] && [[ "${driver}" == "ena" && "${mode}" == "driver" ]]; then
+    (( cur_mtu > ENA_XDP_MAX_MTU )) && want_mtu=${ENA_XDP_MAX_MTU}
+fi
+
+if [[ -n "${want_mtu}" ]] && [[ "${want_mtu}" =~ ^[0-9]+$ ]]; then
+    if (( cur_mtu == want_mtu )); then
+        log "MTU already ${cur_mtu}"
+    elif run ip link set dev "${IFACE}" mtu "${want_mtu}"; then
+        log "MTU ${cur_mtu} -> ${want_mtu} (required for ENA native XDP)"
+    else
+        log "WARNING: could not set MTU to ${want_mtu}; driver-mode XDP will fail"
+    fi
+else
+    log "MTU left at ${cur_mtu} (mode=${mode}, driver=${driver:-unknown})"
+fi
 
 # ---------------------------------------------------------------------------
 # RX/TX ring buffers
@@ -113,10 +162,8 @@ if [[ -n "${chan_output}" ]]; then
         | awk '/^Combined:/ {print $2; exit}')
     ncpu=$(nproc)
 
-    # What XDP mode is dnsd going to use? Grep rather than source: /etc/default
-    # /dnsd holds the policy-controller bearer token, and this runs from udev.
-    link_mode=$(sed -n 's/^DNSD_LINK_MODE="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' \
-        /etc/default/dnsd 2>/dev/null | tail -1)
+    # What XDP mode is dnsd going to use?
+    link_mode=$(dnsd_default DNSD_LINK_MODE)
     link_mode="${link_mode:-generic}"
 
     if [[ "${max_combined:-0}" =~ ^[0-9]+$ ]] && (( max_combined > 0 )); then

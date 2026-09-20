@@ -40,6 +40,15 @@ for p in tasksel tasksel-data reportbug python3-reportbug apt-listchanges \
 # --- Network services that would compete for ports or widen the surface -----
 for p in nfs-common rpcbind avahi-daemon avahi-utils rsync; do add "$p"; done
 
+# --- Ubuntu-specific bulk -----------------------------------------------------
+# snapd alone is ~100 MB plus a squashfs loop mount and a refresh timer, and
+# nothing in this image is a snap. ubuntu-pro-client / ubuntu-advantage-tools
+# are deliberately NOT purged: ubuntu-minimal depends on them and removing them
+# cascades into the base system.
+for p in snapd pollinate landscape-common lxd-installer lxd-agent-loader \
+         motd-news-config ubuntu-release-upgrader-core update-manager-core \
+         friendly-recovery; do add "$p"; done
+
 if [[ "${DISABLE_UNATTENDED_UPGRADES:-true}" == "true" ]]; then
     for p in unattended-upgrades; do add "$p"; done
 fi
@@ -71,6 +80,13 @@ if (( ${#fw_list[@]} )); then
     apt-get purge -y -qq "${fw_list[@]}" || true
 fi
 rm -rf /lib/firmware/* 2>/dev/null || true
+
+# snapd leaves its mounts and state behind after purge.
+if [[ -d /var/lib/snapd || -d /snap ]]; then
+    echo "==> Clearing snapd leftovers"
+    systemctl disable --now snapd.socket snapd.service snapd.seeded.service >/dev/null 2>&1 || true
+    rm -rf /var/lib/snapd /var/cache/snapd /snap /root/snap /home/*/snap 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # Timers and services that only generate wake-ups and log noise

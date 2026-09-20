@@ -19,17 +19,16 @@ EnvironmentFile=/etc/default/dnsd
 # environment (main.go), which keeps the bearer token out of /proc/<pid>/cmdline
 # and out of `ps` output.
 ExecStart=/opt/dashdns/dnsd \
-    -iface=${DNSD_IFACE} \
-    -upstream=${DNSD_UPSTREAM} \
-    -upstream-rules=${DNSD_UPSTREAM_RULES} \
-    -link-mode=${DNSD_LINK_MODE} \
-    -ipam=${DNSD_IPAM} \
-    -blocklist=${DNSD_BLOCKLIST} \
-    -blockips=${DNSD_BLOCKIPS} \
-    -blocked-dns=${DNSD_BLOCKED_DNS} \
-    -ip-blocklist=${DNSD_IP_BLOCKLIST} \
-    -ip-blocklist-interval=${DNSD_IP_BLOCKLIST_INTERVAL} \
-    -ip-blocklist-timeout=${DNSD_IP_BLOCKLIST_TIMEOUT}
+    -iface ${DNSD_IFACE} \
+    -upstream ${DNSD_UPSTREAM} \
+    -upstream-rules ${DNSD_UPSTREAM_RULES} \
+    -ipam ${DNSD_IPAM} \
+    -blocklist ${DNSD_BLOCKLIST} \
+    -blockips ${DNSD_BLOCKIPS} \
+    -blocked-dns ${DNSD_BLOCKED_DNS} \
+    -ip-blocklist ${DNSD_IP_BLOCKLIST} \
+    -ip-blocklist-interval ${DNSD_IP_BLOCKLIST_INTERVAL} \
+    -ip-blocklist-timeout ${DNSD_IP_BLOCKLIST_TIMEOUT} \
 
 Restart=always
 RestartSec=5s

@@ -27,8 +27,18 @@ apt-get install -y -qq --no-install-recommends \
     ethtool \
     iproute2 \
     ca-certificates \
-    bpftool \
     bind9-dnsutils
+
+# bpftool is a standalone package on Debian but ships inside linux-tools on
+# Ubuntu, where the binary is versioned per kernel. Try both.
+if apt-get install -y -qq --no-install-recommends bpftool 2>/dev/null; then
+    echo "    bpftool from the standalone package"
+elif apt-get install -y -qq --no-install-recommends \
+        linux-tools-common "linux-tools-$(uname -r)" 2>/dev/null; then
+    echo "    bpftool from linux-tools-$(uname -r)"
+else
+    echo "    WARNING: no bpftool available; live BPF map inspection will be unavailable"
+fi
 
 # ---------------------------------------------------------------------------
 # Build dependencies — removed in 99-cleanup.sh.
