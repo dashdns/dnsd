@@ -1,0 +1,30 @@
+[Unit]
+Description=Generate missing OpenSSH host keys
+Documentation=man:ssh-keygen(1)
+
+# 99-cleanup.sh deletes /etc/ssh/ssh_host_* so that every instance launched
+# from this AMI gets its own identity — a host key shared across a fleet makes
+# known_hosts meaningless and leaves the door open to MITM.
+#
+# Debian has no equivalent of Fedora's sshd-keygen@.service, so nothing
+# regenerates them on first boot. cloud-init's cc_ssh module does, but it is
+# not ordered before ssh.service: sshd can lose the race and die with
+# "sshd: no hostkeys available -- exiting". Worse, if cloud-init fails for any
+# other reason, SSH never comes up at all and the instance is unreachable.
+# This unit removes that dependency entirely.
+#
+# Ordered before both units because Debian 13 defaults to socket activation
+# (ssh.socket) while ssh.service is still used on upgraded systems.
+After=local-fs.target
+Before=ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# -A creates a key for every type that does not have one and is a no-op once
+# they exist, so this is safe on every boot, not just the first.
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target

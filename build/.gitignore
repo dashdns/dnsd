@@ -1,0 +1,11 @@
+# Build artifacts: source tarball uploaded to the builder, manifest.json
+.artifacts/
+
+# Site-specific variable values (see dnsd.auto.pkrvars.hcl.example)
+*.auto.pkrvars.hcl
+!dnsd.auto.pkrvars.hcl.example
+
+# Packer plugin cache and crash logs
+.packer.d/
+packer_cache/
+crash.log

@@ -1,0 +1,15 @@
+[Unit]
+Description=dnsd memory-proportional network sysctls (udp_mem, tcp_mem)
+Documentation=file:///usr/local/sbin/dnsd-tune-memory
+
+# The static sysctls land first; this only adds the RAM-derived ones.
+After=systemd-sysctl.service
+Before=dnsd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dnsd-tune-memory
+
+[Install]
+WantedBy=multi-user.target
