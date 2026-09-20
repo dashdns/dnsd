@@ -366,6 +366,7 @@ dnsd:
 - [x] Userspace answer cache with TTL and negative caching
 - [ ] Serve-stale: answer from an expired entry when the upstream is unreachable
 - [ ] Coalesce identical in-flight queries into a single upstream request
+- [x] AMI build ability added with packer (for AWS)
 
 ## License
 
