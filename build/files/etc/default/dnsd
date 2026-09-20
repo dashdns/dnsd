@@ -1,0 +1,67 @@
+# dnsd runtime configuration, read by dnsd.service.
+#
+# Baked with the defaults chosen at image build time. Override per instance
+# with cloud-init user-data, for example:
+#
+#   #cloud-config
+#   write_files:
+#     - path: /etc/default/dnsd.d/50-site.conf   # NOT read directly; see below
+#   runcmd:
+#     - sed -i 's|^DNSD_UPSTREAM=.*|DNSD_UPSTREAM="10.0.0.2:53"|' /etc/default/dnsd
+#     - systemctl restart dnsd
+#
+# systemd does not merge drop-ins for EnvironmentFile, so edit this file (or add
+# a systemd drop-in under /etc/systemd/system/dnsd.service.d/) rather than
+# creating siblings.
+#
+# Every value must be a single shell-quoted token: systemd expands ${VAR} in
+# ExecStart without word splitting, so a value containing spaces would arrive as
+# one argument.
+
+# Interface for XDP/TC attachment. Ignored when DNSD_IPAM=aws-vpc-cni, which
+# discovers every ens* NIC and watches netlink for new ENIs instead.
+DNSD_IFACE="@DNSD_IFACE@"
+
+# IPAM mode: onpremise | aws-vpc-cni
+DNSD_IPAM="@DNSD_IPAM@"
+
+# XDP attach mode: generic (SKB, works everywhere) | driver (native, ENA) | offload
+DNSD_LINK_MODE="@DNSD_LINK_MODE@"
+
+# Default upstream resolver. 169.254.169.253 is the AWS VPC resolver (the
+# .2 address of the VPC CIDR also works).
+DNSD_UPSTREAM="@DNSD_UPSTREAM@"
+
+# Conditional upstreams, 'pattern=host:port;pattern2=host2:port2'.
+# e.g. "*.privatelink.*.windows.net=168.63.129.16:53;*.internal.corp=10.0.0.1:53"
+DNSD_UPSTREAM_RULES=""
+
+# Comma-separated global domain blocklist.
+DNSD_BLOCKLIST=""
+
+# Comma-separated IPs to strip from DNS answers.
+DNSD_BLOCKIPS=""
+
+# Comma-separated DNS servers clients are not allowed to reach (enforced by the
+# TC egress program).
+DNSD_BLOCKED_DNS=""
+
+# Static per-IP blocklist, 'IP1:domain1,domain2;IP2:domain3'.
+DNSD_IP_BLOCKLIST=""
+
+# ---------------------------------------------------------------------------
+# Policy controller
+#
+# These two are read from the environment by dnsd itself, so they never appear
+# on the command line. Keep this file mode 0600 — the token is a credential.
+# ---------------------------------------------------------------------------
+
+# Base URL (http://host:8080) or full endpoint (http://host:8080/api/policies).
+DNSD_IP_BLOCKLIST_URL=""
+
+# Appliance token from POST /api/admin/appliances. Must start with 'dnsdap_';
+# an admin session token (dnsdsn_) makes dnsd refuse to start.
+DNSD_IP_BLOCKLIST_TOKEN=""
+
+DNSD_IP_BLOCKLIST_INTERVAL="5m"
+DNSD_IP_BLOCKLIST_TIMEOUT="30s"

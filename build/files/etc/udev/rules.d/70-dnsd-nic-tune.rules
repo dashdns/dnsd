@@ -1,0 +1,13 @@
+# Run dnsd-tune-nic against every physical NIC as it appears.
+#
+# This covers hot-plugged ENIs as well as boot-time devices, which matters in
+# -ipam aws-vpc-cni mode: dnsd watches netlink for new ENIs and attaches XDP to
+# them, so their rings need sizing at the same moment.
+#
+# Virtual devices are filtered out by driver presence rather than by name, so
+# veth/docker/bridge/tunnel interfaces are skipped without maintaining a list.
+
+ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", \
+    ENV{DEVTYPE}!="bridge", ENV{DEVTYPE}!="vlan", \
+    DRIVERS=="?*", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}+="dnsd-tune-nic@$name.service"

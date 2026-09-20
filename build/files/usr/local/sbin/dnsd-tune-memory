@@ -1,0 +1,38 @@
+#!/bin/bash
+# Apply the memory-proportional sysctls that cannot be baked into a static
+# sysctl.d file, because the build instance and the runtime instance may have
+# very different amounts of RAM.
+#
+# net.ipv4.udp_mem and net.ipv4.tcp_mem are triples of *pages*:
+#   min       below this, never prune
+#   pressure  above this, start reclaiming socket buffers
+#   max       hard ceiling for all sockets of that protocol
+#
+# Kernel defaults size udp_mem max at roughly 9% of RAM. dnsd is a UDP-first
+# workload, so give it more headroom and let TCP keep a smaller slice.
+
+set -euo pipefail
+
+page_size=$(getconf PAGE_SIZE)
+mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+total_pages=$(( mem_total_kb * 1024 / page_size ))
+
+pct() { echo $(( total_pages * $1 / 100 )); }
+
+udp_min=$(pct 6)
+udp_pressure=$(pct 12)
+udp_max=$(pct 24)
+
+tcp_min=$(pct 3)
+tcp_pressure=$(pct 6)
+tcp_max=$(pct 12)
+
+sysctl -qw "net.ipv4.udp_mem=${udp_min} ${udp_pressure} ${udp_max}"
+sysctl -qw "net.ipv4.tcp_mem=${tcp_min} ${tcp_pressure} ${tcp_max}"
+
+printf 'dnsd-tune-memory: %s MiB RAM, %s-byte pages\n' \
+    "$(( mem_total_kb / 1024 ))" "${page_size}"
+printf 'dnsd-tune-memory: udp_mem = %s %s %s pages\n' \
+    "${udp_min}" "${udp_pressure}" "${udp_max}"
+printf 'dnsd-tune-memory: tcp_mem = %s %s %s pages\n' \
+    "${tcp_min}" "${tcp_pressure}" "${tcp_max}"

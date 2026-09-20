@@ -1,0 +1,46 @@
+// Copy to dnsd.auto.pkrvars.hcl and edit. Packer loads *.auto.pkrvars.hcl
+// automatically; that filename is gitignored so site values never get
+// committed.
+
+region       = "eu-central-1"
+dnsd_version = "v1.0.0"
+
+// Share the finished AMI with the rest of the estate.
+// ami_regions = ["eu-west-1", "us-east-1"]
+// ami_users   = ["111122223333"]
+
+// Build inside an existing VPC instead of the default one.
+// vpc_id                      = "vpc-0123456789abcdef0"
+// subnet_id                   = "subnet-0123456789abcdef0"
+// associate_public_ip_address = false
+// ssh_interface               = "session_manager"
+// iam_instance_profile        = "packer-ssm-builder"
+
+// ---------------------------------------------------------------------------
+// Runtime defaults written into /etc/default/dnsd
+// ---------------------------------------------------------------------------
+
+// Nitro instances name the primary ENA interface ens5.
+dnsd_iface = "ens5"
+
+// The AWS VPC resolver. Use a concrete upstream for on-prem/hybrid setups.
+dnsd_upstream = "169.254.169.253:53"
+
+// ENA supports native XDP. Fall back to "generic" for instance families
+// without ENA, or when running nested.
+dnsd_link_mode = "driver"
+
+// "aws-vpc-cni" makes dnsd attach to every ens* NIC and watch netlink for
+// ENIs added later — the right mode for an EKS node.
+dnsd_ipam = "onpremise"
+
+// ---------------------------------------------------------------------------
+// Toolchain / slimming
+// ---------------------------------------------------------------------------
+
+// go_version  = "1.25.6"
+// llvm_version = "19"
+
+// strip_kernel_modules        = true
+// purge_packages              = true
+// disable_unattended_upgrades = true

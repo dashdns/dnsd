@@ -1,0 +1,26 @@
+[Unit]
+Description=dnsd NIC tuning for %I (ring buffers, queues, offloads)
+Documentation=file:///usr/local/sbin/dnsd-tune-nic
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+
+# Both `ethtool -G` and `ethtool -L` bounce the link (ena_close/ena_open).
+# Doing that the instant udev sees the device races cloud-init and DHCP, and an
+# instance that loses its lease here comes up with no address at all — console
+# shows a login prompt, but nothing answers on :22.
+#
+# The IP configuration survives a driver close/open, so waiting until the
+# network is up costs nothing and removes the race. dnsd.service is ordered
+# after the same target, so tuning still lands before any XDP attach.
+Wants=network-online.target
+After=network-online.target
+Before=dnsd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dnsd-tune-nic %I
+
+# Tuning is best-effort: a driver that rejects a resize must not block boot or
+# keep dnsd.service from starting.
+SuccessExitStatus=0 64

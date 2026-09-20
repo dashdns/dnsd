@@ -1,0 +1,192 @@
+#!/bin/bash
+# Per-interface NIC tuning for the dnsd appliance.
+#
+# RX/TX ring buffers are *not* sysctls — they are driver ring descriptors
+# resized with `ethtool -G`. This script raises them to the hardware maximum
+# the driver reports, sizes the combined queue count to the available CPUs,
+# and turns off the offloads that are incompatible with XDP.
+#
+# Invoked once per NIC by dnsd-tune-nic@.service, which udev triggers on
+# device add (see /etc/udev/rules.d/70-dnsd-nic-tune.rules).
+#
+# Usage: dnsd-tune-nic <interface>
+
+set -uo pipefail
+
+IFACE="${1:-}"
+log() { printf 'dnsd-tune-nic[%s]: %s\n' "${IFACE:--}" "$*"; }
+
+# DNSD_TUNE_DRY_RUN=1 reports what would change without touching the NIC.
+# The image build uses this: every ethtool write below bounces the link, and
+# the builder's SSH session runs over that same interface.
+DRY_RUN="${DNSD_TUNE_DRY_RUN:-0}"
+apply() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        log "DRY RUN: would run: ethtool $*"
+        return 0
+    fi
+    ethtool "$@" 2>/dev/null
+}
+
+if [[ -z "${IFACE}" ]]; then
+    echo "usage: dnsd-tune-nic <interface>" >&2
+    exit 64
+fi
+
+if [[ ! -e "/sys/class/net/${IFACE}" ]]; then
+    log "interface does not exist, nothing to do"
+    exit 0
+fi
+
+# Only tune real NICs. Virtual devices (lo, veth, bridges, tunnels, dummy)
+# have no ../devices/ symlink and no meaningful rings.
+if [[ ! -e "/sys/class/net/${IFACE}/device" ]]; then
+    log "virtual interface, skipping"
+    exit 0
+fi
+
+if ! command -v ethtool >/dev/null 2>&1; then
+    log "ethtool not installed, skipping"
+    exit 0
+fi
+
+driver=$(ethtool -i "${IFACE}" 2>/dev/null | awk '/^driver:/ {print $2}')
+log "driver=${driver:-unknown}"
+
+# ---------------------------------------------------------------------------
+# RX/TX ring buffers
+#
+# `ethtool -g` prints two blocks: "Pre-set maximums" then "Current hardware
+# settings". Read the maxima out of the first block only.
+#
+# On ENA the RX ring maximum is typically 16384 and TX 1024; on virtio-net both
+# are 4096. Deeper rings absorb the microbursts that would otherwise be dropped
+# by the NIC before XDP ever runs — those drops are invisible to dnsd's own
+# counters and only show up in `ethtool -S` as rx_ring_full / rx_no_buffer.
+# ---------------------------------------------------------------------------
+ring_output=$(ethtool -g "${IFACE}" 2>/dev/null) || ring_output=""
+
+if [[ -n "${ring_output}" ]]; then
+    maxima=$(echo "${ring_output}" | sed -n '/Pre-set maximums:/,/Current hardware settings:/p')
+    max_rx=$(echo "${maxima}" | awk '/^RX:/ {print $2; exit}')
+    max_tx=$(echo "${maxima}" | awk '/^TX:/ {print $2; exit}')
+
+    current=$(echo "${ring_output}" | sed -n '/Current hardware settings:/,$p')
+    cur_rx=$(echo "${current}" | awk '/^RX:/ {print $2; exit}')
+    cur_tx=$(echo "${current}" | awk '/^TX:/ {print $2; exit}')
+
+    # A ring resize bounces the link, so only ask for what actually changes.
+    args=()
+    [[ "${max_rx:-0}" =~ ^[0-9]+$ ]] && (( max_rx > 0 )) && [[ "${cur_rx}" != "${max_rx}" ]] && args+=(rx "${max_rx}")
+    [[ "${max_tx:-0}" =~ ^[0-9]+$ ]] && (( max_tx > 0 )) && [[ "${cur_tx}" != "${max_tx}" ]] && args+=(tx "${max_tx}")
+
+    if (( ${#args[@]} )); then
+        if apply -G "${IFACE}" "${args[@]}"; then
+            log "ring buffers set to ${args[*]} (was rx=${cur_rx} tx=${cur_tx})"
+        else
+            # Not fatal: some drivers reject a resize while XDP is attached, and
+            # some report a maximum they will not actually accept.
+            log "WARNING: could not set ring buffers to ${args[*]}"
+        fi
+    else
+        log "ring buffers already at maximum (rx=${cur_rx} tx=${cur_tx})"
+    fi
+else
+    log "driver does not report ring parameters, skipping -G"
+fi
+
+# ---------------------------------------------------------------------------
+# Combined RX/TX queues
+#
+# One queue per CPU spreads the XDP program across all cores — but on ENA in
+# native XDP mode that is exactly the wrong thing to ask for. See the comment
+# on the cap below.
+# ---------------------------------------------------------------------------
+chan_output=$(ethtool -l "${IFACE}" 2>/dev/null) || chan_output=""
+
+if [[ -n "${chan_output}" ]]; then
+    max_combined=$(echo "${chan_output}" \
+        | sed -n '/Pre-set maximums:/,/Current hardware settings:/p' \
+        | awk '/^Combined:/ {print $2; exit}')
+    cur_combined=$(echo "${chan_output}" \
+        | sed -n '/Current hardware settings:/,$p' \
+        | awk '/^Combined:/ {print $2; exit}')
+    ncpu=$(nproc)
+
+    # What XDP mode is dnsd going to use? Grep rather than source: /etc/default
+    # /dnsd holds the policy-controller bearer token, and this runs from udev.
+    link_mode=$(sed -n 's/^DNSD_LINK_MODE="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' \
+        /etc/default/dnsd 2>/dev/null | tail -1)
+    link_mode="${link_mode:-generic}"
+
+    if [[ "${max_combined:-0}" =~ ^[0-9]+$ ]] && (( max_combined > 0 )); then
+        # ------------------------------------------------------------------
+        # ENA reserves one TX queue per RX queue for XDP_TX/XDP_REDIRECT, so
+        # it refuses to attach a native XDP program unless the channel count
+        # is at most HALF the hardware maximum:
+        #
+        #   ena ... Failed to set xdp program, the Rx/Tx channel count should
+        #   be at most half of the maximum allowed channel count.
+        #
+        # Taking all 4 channels on a 4-channel NIC (c6i.xlarge) makes
+        # -link-mode=driver fail outright, and dnsd exits. Cap it here.
+        # Irrelevant in generic mode, where XDP runs in the stack and reserves
+        # nothing — so only halve when it actually buys an attachable NIC.
+        # ------------------------------------------------------------------
+        usable=${max_combined}
+        if [[ "${driver}" == "ena" && "${link_mode}" == "driver" ]]; then
+            usable=$(( max_combined / 2 ))
+            (( usable < 1 )) && usable=1
+            log "ENA + driver-mode XDP: capping channels at max/2 = ${usable}"
+        fi
+
+        want=$(( ncpu < usable ? ncpu : usable ))
+        (( want < 1 )) && want=1
+
+        # Changing the channel count bounces the link (ena_close/ena_open).
+        # Skip the call when it would be a no-op — on a boot-time NIC this
+        # avoids a needless reset while DHCP is still settling.
+        if [[ "${cur_combined}" == "${want}" ]]; then
+            log "combined queues already ${want}, leaving the link alone"
+        elif apply -L "${IFACE}" combined "${want}"; then
+            log "combined queues ${cur_combined:-?} -> ${want} (cpus=${ncpu}, max=${max_combined}, mode=${link_mode})"
+        else
+            log "WARNING: could not set combined queues to ${want}"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Offloads
+#
+# LRO must be off: it coalesces frames in the NIC, which destroys the 1:1
+# packet view XDP depends on. The kernel force-disables it when an XDP program
+# attaches, but doing it here keeps the pre- and post-attach state identical.
+#
+# GRO stays ON — it runs after XDP, so it never hides packets from the filter,
+# and it helps the TCP metrics/policy paths.
+# ---------------------------------------------------------------------------
+apply -K "${IFACE}" lro off \
+    && log "LRO disabled" \
+    || log "LRO not configurable (already off or unsupported)"
+
+# ---------------------------------------------------------------------------
+# Interrupt coalescing
+#
+# Adaptive RX lets the driver trade interrupts for latency automatically, which
+# suits DNS: small packets, bursty arrival, latency-sensitive.
+# ---------------------------------------------------------------------------
+apply -C "${IFACE}" adaptive-rx on \
+    && log "adaptive-rx enabled" \
+    || log "adaptive-rx unsupported"
+
+# ---------------------------------------------------------------------------
+# Per-queue backlog
+# ---------------------------------------------------------------------------
+if [[ -w "/sys/class/net/${IFACE}/tx_queue_len" ]] 2>/dev/null; then
+    ip link set dev "${IFACE}" txqueuelen 10000 2>/dev/null \
+        && log "txqueuelen set to 10000"
+fi
+
+log "done"
+exit 0

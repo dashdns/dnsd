@@ -1,0 +1,82 @@
+[Unit]
+Description=dnsd - eBPF/XDP DNS filtering proxy
+Documentation=https://github.com/dashdns/dnsd
+After=network-online.target dnsd-tune-memory.service
+Wants=network-online.target dnsd-tune-memory.service
+ConditionPathExists=/opt/dashdns/dnsd
+
+# An appliance must keep retrying forever. dnsd calls log.Fatalf when its
+# interface is not up yet, which is expected on a cold boot with a hot-plugged
+# ENI, so the restart counter must never trip the start limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/default/dnsd
+
+# The policy controller URL and appliance token are deliberately NOT passed as
+# flags: dnsd reads DNSD_IP_BLOCKLIST_URL and DNSD_IP_BLOCKLIST_TOKEN from the
+# environment (main.go), which keeps the bearer token out of /proc/<pid>/cmdline
+# and out of `ps` output.
+ExecStart=/opt/dashdns/dnsd \
+    -iface=${DNSD_IFACE} \
+    -upstream=${DNSD_UPSTREAM} \
+    -upstream-rules=${DNSD_UPSTREAM_RULES} \
+    -link-mode=${DNSD_LINK_MODE} \
+    -ipam=${DNSD_IPAM} \
+    -blocklist=${DNSD_BLOCKLIST} \
+    -blockips=${DNSD_BLOCKIPS} \
+    -blocked-dns=${DNSD_BLOCKED_DNS} \
+    -ip-blocklist=${DNSD_IP_BLOCKLIST} \
+    -ip-blocklist-interval=${DNSD_IP_BLOCKLIST_INTERVAL} \
+    -ip-blocklist-timeout=${DNSD_IP_BLOCKLIST_TIMEOUT}
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# dnsd refuses to run unless geteuid() == 0 (it loads BPF, creates a clsact
+# qdisc and binds :53), so it runs as root with a trimmed bounding set rather
+# than as a capability-only user.
+User=root
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_NICE
+
+# main.go never calls rlimit.RemoveMemlock(), so the memlock ceiling must come
+# from here. Without it, loading the BPF maps fails with EPERM on kernels that
+# still account maps against RLIMIT_MEMLOCK.
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# One in-flight upstream socket per client query; keep the resolver ahead of
+# best-effort work and out of reach of the OOM killer.
+Nice=-10
+OOMScoreAdjust=-800
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+# Sandboxing.
+#
+# ProtectKernelTunables and ProtectKernelModules are intentionally left OFF:
+# both remount /sys read-only, which would break BPF map pinning under
+# /sys/fs/bpf if it is ever added, and interfere with clsact module autoload.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=no
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnsd
+
+[Install]
+WantedBy=multi-user.target
